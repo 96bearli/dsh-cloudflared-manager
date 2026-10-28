@@ -143,6 +143,19 @@ $DSH_HOME/cloudflared-setup/
 设置页有独立的「根域名白名单」区，可逐个添加/移除，并点「校验可用性」现场确认
 每个域名能否写 DNS。
 
+**`credentials.json` 不需要手工准备。** 全新安装时运行目录里没有这个文件，
+首次点「启动」时插件会自动生成它：调用 Cloudflare 的
+`GET /accounts/{accountId}/cfd_tunnel/{tunnelId}/token`（要求 Token 含
+Account → Cloudflare Tunnel → **Read**），把返回的隧道 token 解出来就是
+`{ AccountTag, TunnelID, TunnelSecret }`，即 `credentials.json` 的三个字段，
+生成后权限自动设为 `600`。
+
+因此只要 API Token + Account ID + Tunnel ID 三项填对，Named 隧道就能直接跑起来。
+没配 Token 时插件会在面板上明确提示，并保留手工路径：用该隧道的 token 执行
+`cloudflared tunnel run --token <TOKEN>`，或从已有部署拷一份 `credentials.json`。
+文件里的 TunnelID 与当前 `tunnelId` 不一致时（换过隧道、或拷了别人的文件），
+启动时同样会自动重建。
+
 > **不需要填 Zone ID。** 插件按域名后缀自动解析对应的 zone（要求 Token 有
 > Zone:Read 权限）。`zoneId` 字段已废弃：旧版用它做「解析不出 zone 时」的兜底
 > 放行，但单个 zoneId 只能对应一个 zone，拿它去建另一个首级域名的记录会让
@@ -264,6 +277,9 @@ host 端代码在 DSH 启动时被 require 进内存，改完必须重启 DSH。
 
 **域名打不开但隧道是健康的？**
 检查 DNS CNAME 是否指向 `<tunnelId>.cfargotunnel.com` 且已代理（橙云）。没配 API Token 时插件不会自动建 DNS 记录。
+
+**隧道显示健康、连接数正常，域名却全是 502？**
+502 表示隧道这一层通了、但后端没人应答：cloudflared 把请求转到了 ingress 里写的本地端口，而那个端口上没有服务在监听。本插件的「健康」只反映 cloudflared 与 Cloudflare 边缘之间的连接数（`connections > 0`），不代表后端存活。排查：看 `cf-status` 返回的 `namedTunnel.ingress` 里的端口列表，逐个 `curl -o /dev/null -w '%{http_code}' http://127.0.0.1:<port>/`（返回 `000` 即无服务监听），再把这些服务在「本地服务」页签里建好并启动。
 
 ---
 

@@ -1185,6 +1185,13 @@ window.__ModuleLoader__.load({
         const namedRunning = !!(nt && nt.running)
         const namedHealthy = !!(nt && nt.healthy)
         const dnsOn = !!(ca && ca.tokenSet)
+        // 凭据自检（host 端 cf-status 返回 credentials 字段）。
+        // 新装环境里 credentials.json 本来就不存在，点「启动」时由 host 用 API Token
+        // 从云端隧道 token 自动生成——但用户看不到这件事，容易以为插件坏了。
+        // 这里提前把「首次启动会自动生成」说出来，而不是等报错才让用户去猜。
+        const cred = status && status.credentials
+        const credMissing = !!(cred && cred.exists === false)
+        const credBroken = !!(cred && cred.exists && (!cred.tunnelMatch || !cred.hasSecret))
 
         // 备注小窗：点服务名弹出，纯展示「名称 :端口 + 一句话用途」，点外面消失。
         // 备注的修改统一走「编辑」表单（新增/编辑时都能填），小窗里不放按钮。
@@ -1632,6 +1639,16 @@ window.__ModuleLoader__.load({
           // 告警条（状态加载失败 / cloudflared 未安装）
           error ? React.createElement('div', { className: 'dshcf-warnbar' }, '⚠ 状态加载失败：' + error + '（点右上「⟳ 刷新」重试）') : null,
           (cf && !cf.installed) ? React.createElement('div', { className: 'dshcf-warnbar' }, '⚠ cloudflared 未安装且自动安装失败：' + (cf.error || '')) : null,
+          // 凭据提示：新装不会自带 credentials.json，但配了 API Token 就能自动生成。
+          // 只在这两种异常情况下出现一行，正常时不占空间。
+          credMissing ? React.createElement('div', { className: 'dshcf-warnbar' },
+            dnsOn
+              ? 'ℹ 尚未生成隧道凭据 credentials.json：首次点「启动」时会用 API Token 自动生成，无需手工处理。'
+              : '⚠ 尚未生成隧道凭据 credentials.json，且未配置 API Token，无法自动生成：请先在 设置 → Cloudflared 隧道 填入 API Token（需 Cloudflare Tunnel:Read）。'
+          ) : null,
+          credBroken ? React.createElement('div', { className: 'dshcf-warnbar' },
+            '⚠ 隧道凭据 credentials.json 与当前隧道不匹配（或内容不完整）：点「启动」时会自动重建。'
+          ) : null,
           // 页签栏
           React.createElement('div', { className: 'dshcf-tabs' },
             tabs.map((t) => React.createElement('button', {

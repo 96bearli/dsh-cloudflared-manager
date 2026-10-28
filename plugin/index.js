@@ -17,7 +17,7 @@ import fs from 'node:fs'
 
 export const inject = ['shell', 'webServer']
 
-const PLUGIN_VERSION = '1.8.0'
+const PLUGIN_VERSION = '1.9.0'
 // ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
 //
 // 解析顺序：
@@ -781,6 +781,69 @@ export function apply(ctx) {
     return { ok: true, cloudSynced: !!(cfg.apiToken) }
   }
 
+  // 确保 credentials.json 存在且与当前 tunnelId 匹配；缺失时自动生成。
+  //
+  // 背景（2026-10-28 实测）：全新安装**不会**有 credentials.json——插件从不创建它，
+  // 而 cloudflared 没有它就拒绝启动。旧实现直接报错让用户去「用 token 重新授权」
+  // 或「从备份恢复」，这两条对新用户都不成立（没有备份、也不知道 token 在哪）。
+  //
+  // 实际上这个文件是可再生的：Cloudflare 有 `GET /accounts/{acc}/cfd_tunnel/{id}/token`
+  // 端点，返回的隧道 token 是 base64(JSON)，解出来就是
+  //   { a: AccountTag, t: TunnelID, s: TunnelSecret }
+  // 正好是 credentials.json 需要的三个字段（字段名不同而已）。
+  // 所以只要配了 API Token（且含 Cloudflare Tunnel:Read），就能自动补齐，
+  // 用户不需要手工折腾。
+  //
+  // 顺带处理另一种静默故障：credentials.json 里的 TunnelID 与 cf_config.json 的
+  // tunnelId 不一致（换过隧道、或从别的部署拷过来的文件）→ cloudflared 认证失败，
+  // 日志只有一行难懂的 403。这里一并校验并重写。
+  async function ensureCredentials(cfg) {
+    const wantTunnel = TUNNEL_ID()
+    if (!wantTunnel) return { ok: false, error: '尚未配置隧道 ID（tunnelId）' }
+
+    // 1) 已有文件且 TunnelID 对得上 → 直接用
+    const chk = await sh(`test -s ${CREDENTIALS_JSON} && echo yes || echo no`, 5000)
+    if ((chk.output || '').includes('yes')) {
+      const cur = await sh(`cat ${CREDENTIALS_JSON}`, 5000)
+      let parsed = null
+      try { parsed = JSON.parse(cur.output || '{}') } catch (e) { parsed = null }
+      if (parsed && parsed.TunnelID === wantTunnel && parsed.AccountTag && parsed.TunnelSecret) {
+        return { ok: true, existed: true }
+      }
+      // 内容不完整或隧道对不上 → 落到下面重新生成
+    }
+
+    // 2) 用 API Token 拉隧道 token 并解码
+    if (!cfg.apiToken) {
+      return {
+        ok: false,
+        error: '缺少 credentials.json，且未配置 API Token，无法自动生成。'
+          + '请在设置页填入 Cloudflare API Token（需 Cloudflare Tunnel:Read），'
+          + '或用该隧道的 token 运行一次 cloudflared tunnel run --token <TOKEN> 生成凭据。',
+      }
+    }
+    const res = await cfApiGet(cfg, `/accounts/${ACCOUNT_ID()}/cfd_tunnel/${wantTunnel}/token`)
+    if (!res.success || typeof res.result !== 'string' || !res.result) {
+      const msg = (res.errors && res.errors[0] && res.errors[0].message) || '未知错误'
+      return {
+        ok: false,
+        error: '自动生成 credentials.json 失败：' + msg
+          + '（API Token 需含 Cloudflare Tunnel:Read 权限）',
+      }
+    }
+    let dec = null
+    try { dec = JSON.parse(Buffer.from(res.result, 'base64').toString('utf8')) } catch (e) { dec = null }
+    if (!dec || !dec.a || !dec.t || !dec.s) {
+      return { ok: false, error: '自动生成 credentials.json 失败：隧道 token 内容无法解析' }
+    }
+    const cred = { AccountTag: dec.a, TunnelID: dec.t, TunnelSecret: dec.s }
+    const b64 = Buffer.from(JSON.stringify(cred, null, 2), 'utf8').toString('base64')
+    // 权限 600：文件含 TunnelSecret，等同于隧道私钥，不能让同机其他用户读到
+    const w = await sh(`mkdir -p ${CF_SETUP} && umask 077 && echo '${b64}' | base64 -d > ${CREDENTIALS_JSON} && chmod 600 ${CREDENTIALS_JSON}`, 5000)
+    if (!w.ok) return { ok: false, error: '写入 credentials.json 失败：' + (w.output || '').slice(-200) }
+    return { ok: true, existed: false, generated: true }
+  }
+
   // 重启 Named 隧道（config 模式）：kill 现有进程 → nohup 启动（写 PID 文件）→ 等 metrics
   async function restartNamedTunnel() {
     // ⚠ 必须先确保二进制就位。
@@ -803,20 +866,18 @@ export function apply(ctx) {
     //   很容易被误判成"隧道启动不起来"。
     //   现在：config.yml 由 buildYaml 按当前 ingress 现生成（内容来自云端或
     //   本地，缺就写一份含 catch-all 的最小配置）；credentials.json 缺失时
-    //   明确报错并说明怎么补，而不是让进程静默退出。
+    //   由 ensureCredentials 从 API Token 自动生成（见该函数注释），
+    //   生成不了才报错并说明怎么补。
     const cfg0 = await readCfConfig()
     if (!TUNNEL_ID()) {
       return { error: '尚未配置隧道 ID（tunnelId）：请先在设置里填写，否则无法生成 config.yml' }
     }
-    const chkCred = await sh(`test -s ${CREDENTIALS_JSON} && echo yes || echo no`, 5000)
-    if (!(chkCred.output || '').includes('yes')) {
-      return {
-        error: '缺少隧道凭据文件 credentials.json：cloudflared 无法认证。'
-          + '请用该隧道的 token 重新授权（cloudflared tunnel run --token <TOKEN>），'
-          + '或从备份恢复 credentials.json 后重试。'
-          + '（该文件包含 AccountTag / TunnelID / TunnelSecret，不会由插件自动生成）',
-      }
+    const cred = await ensureCredentials(cfg0)
+    if (!cred.ok) return { error: cred.error }
+    if (cred.generated) {
+      console.log('dsh-cloudflared-manager: 已根据 API Token 自动生成 credentials.json')
     }
+
     // 按当前 ingress 重写 config.yml（幂等）。ingress 来源：云端优先，失败回退本地。
     // 这样即使文件不存在，也会被正确创建出来，而不是等 cloudflared 报错。
     const cur = await readIngress({ force: true })
@@ -1156,6 +1217,20 @@ export function apply(ctx) {
             quickTunnels: maps,
             binPath: CLOUDFLARED_BIN,
             cfApi: { tokenSet: !!(cfg.apiToken) },
+            // 凭据自检：新装环境下 credentials.json 是不存在的。
+            // 这里只做「文件在不在 + 隧道 ID 对不对」的读校验，不触发网络请求，
+            // 面板可据此提示「首次启动会自动生成」，而不是让用户去猜为什么起不来。
+            credentials: await (async () => {
+              try {
+                const txt = fs.readFileSync(CREDENTIALS_JSON, 'utf8')
+                const o = JSON.parse(txt)
+                return {
+                  exists: true,
+                  tunnelMatch: o.TunnelID === TUNNEL_ID(),
+                  hasSecret: !!o.TunnelSecret && !!o.AccountTag,
+                }
+              } catch (e) { return { exists: false } }
+            })(),
             // 快速隧道的 URL 改写代理前缀：前端据此决定是显示代理地址还是「未配置」。
             // 放在 cf-status 里一起返回，避免面板每轮刷新再多打一次接口。
             proxyPrefix: typeof cfg.proxyPrefix === 'string' ? cfg.proxyPrefix : '',

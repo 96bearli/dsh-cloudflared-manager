@@ -1,6 +1,6 @@
 {
   "name": "dsh-cloudflared-manager",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Cloudflare Tunnel + 本地服务管理器（DSH 插件）：Named 隧道增删改查、本地服务启停与日志、源码在线编辑、快速隧道临时公网，DNS 自动同步",
   "type": "module",
   "main": "./plugin/index.js",
