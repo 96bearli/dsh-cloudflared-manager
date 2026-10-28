@@ -21,34 +21,47 @@ const PLUGIN_VERSION = '1.1.0'
 // ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
 //
 // 解析顺序：
-//   1. 环境变量 DSH_CF_SETUP（显式指定，优先级最高）
-//   2. $DSH_HOME/cloudflared-setup（默认，新装用户走这条）
-//   3. 若干历史路径（老版本把目录放在别处，升级后不能因为路径变了就"丢失"配置）
+//   1. 环境变量 DSH_CF_SETUP（显式指定，最高优先级）
+//   2. $DSH_HOME/cloudflared-setup（默认）
+//   3. 自动发现：$DSH_HOME 下两级目录里任何含 cf_config.json / services.json 的
+//      cloudflared-setup 目录（兼容把工作目录放在 $DSH_HOME/<子目录>/ 下的老部署）
 //
-// ⚠ 为什么要有第 3 步：本插件早期版本把运行目录硬编码在代码里（如
-//   /data/dsh/home/test/cloudflared-setup）。如果升级后只认新默认值，
-//   老用户的所有配置（隧道凭证、服务定义、API Token）会突然"消失"——
-//   表现为面板全空、服务列表 0 条。这里按顺序探测，命中第一个**确实存在
-//   cf_config.json 或 services.json** 的目录，避免这种静默故障。
+// ⚠ 为什么需要第 3 步：不同时期安装的部署，运行目录位置可能不同（例如放在
+//   $DSH_HOME 的某个子目录下）。如果只认固定的新默认值，升级后就读不到原有配置，
+//   表现为面板全空、服务列表 0 条、隧道 ingress 为空——看起来像"配置全丢了"。
+//   这里做一次浅层扫描自动发现，避免这种静默故障，也避免在代码里硬编码
+//   任何具体机器的路径。
+const SETUP_DIRNAME = 'cloudflared-setup'
+
+function looksLikeSetup(dir) {
+  try {
+    return fs.existsSync(dir + '/cf_config.json') || fs.existsSync(dir + '/services.json')
+  } catch (e) { return false }
+}
+
 function resolveCfSetup() {
   if (process.env.DSH_CF_SETUP) return process.env.DSH_CF_SETUP
   const home = process.env.DSH_HOME || '/data/dsh'
-  const candidates = [
-    home + '/cloudflared-setup',
-    // 历史路径（存在旧配置时继续沿用）
-    home + '/home/test/cloudflared-setup',
-    '/data/dsh/home/test/cloudflared-setup',
-  ]
-  const looksLikeSetup = (dir) => {
-    try {
-      return fs.existsSync(dir + '/cf_config.json') || fs.existsSync(dir + '/services.json')
-    } catch (e) { return false }
-  }
-  for (const dir of candidates) {
-    if (looksLikeSetup(dir)) return dir
-  }
-  // 都没配置：返回默认值，由 ensureCloudflared 等逻辑按需创建
-  return candidates[0]
+  const preferred = home + '/' + SETUP_DIRNAME
+  if (looksLikeSetup(preferred)) return preferred
+  // 浅层扫描：$DSH_HOME/*/cloudflared-setup 与 $DSH_HOME/*/*/cloudflared-setup
+  try {
+    for (const a of fs.readdirSync(home)) {
+      if (a === 'node_modules' || a.startsWith('.')) continue
+      const lvl1 = home + '/' + a
+      const c1 = lvl1 + '/' + SETUP_DIRNAME
+      if (looksLikeSetup(c1)) return c1
+      let subs = []
+      try { subs = fs.readdirSync(lvl1) } catch (e) { continue }
+      for (const b of subs) {
+        if (b === 'node_modules' || b.startsWith('.')) continue
+        const c2 = lvl1 + '/' + b + '/' + SETUP_DIRNAME
+        if (looksLikeSetup(c2)) return c2
+      }
+    }
+  } catch (e) { /* 读不到 home 就用默认值 */ }
+  // 都没有：返回默认值，由后续逻辑按需创建
+  return preferred
 }
 const CF_SETUP = resolveCfSetup()
 const CLOUDFLARED_BIN = CF_SETUP + '/node_modules/@farthershore/cloudflared-linux-x64/bin/cloudflared'
@@ -285,7 +298,7 @@ export function apply(ctx) {
     if ((chk.output || '').includes('yes')) return { ok: true, installed: true }
     // 未安装：通过 npm 安装（npm registry 可达）
     const inst = await sh(
-      `mkdir -p ${CF_SETUP} && cd ${CF_SETUP} && npm install --cache /data/dsh/home/test/.npm-cache @farthershore/cloudflared-linux-x64 2>&1 | tail -3`,
+      `mkdir -p ${CF_SETUP} && cd ${CF_SETUP} && npm install --cache ${CF_SETUP}/.npm-cache @farthershore/cloudflared-linux-x64 2>&1 | tail -3`,
       180000,
     )
     const chk2 = await sh(`test -x ${CLOUDFLARED_BIN} && echo yes || echo no`, 5000)
@@ -737,7 +750,7 @@ export function apply(ctx) {
   //        注意：命令里常写相对脚本名（`node serve.js 8097`），真实 cmdline 里
   //        也是相对形式，所以**相对脚本名同样可用**，不必要求含 /。
   //     2) 其它带 / 的路径参数，但**排除通用可执行目录**里的裸解释器
-  //        （/usr/local/bin/node、/data/dsh/home/test/bin/python 这类会命中所有
+  //        （/usr/local/bin/node、/usr/bin/python3 这类会命中所有
   //         node/python 进程，是假阳性之源）
   //     3) 实在没有路径就退化成第一个词（要求 ≥3 字符）
   function svcCmdFrag(svc) {

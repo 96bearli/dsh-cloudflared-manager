@@ -1,18 +1,41 @@
 # 本地服务定义模板（services.json）
-# 迁移到新环境后按需修改：name / port / command / cwd
-# 注意：启动命令由插件以 `bash -c 'cd <cwd> && exec <command> > <log> 2>&1'` 方式执行，
-#       $! 即服务进程 PID（写入 PID 文件），停止/重启可靠。
+#
+# 用法：复制为 <DSH_HOME>/cloudflared-setup/services.json 后按需修改。
+#
+# 字段说明：
+#   name       服务名（唯一）
+#   port       探活用端口，无端口服务填 null
+#   command    启动命令，建议写完整路径（DSH 的 PATH 不保证覆盖）
+#   cwd        工作目录
+#   autoStart  DSH 启动时是否自动拉起（可选，默认 false）
+#   note       一句话备注，面板里点服务名查看（可选）
+#
+# 说明：启动命令由插件以
+#   bash -c 'cd <cwd> && exec <command> > <log> 2>&1'
+# 方式执行，因此 $! 即服务进程 PID（写入 PID 文件），停止/重启可靠。
 [
   {
-    "name": "虚拟世界聊天群",
+    "name": "示例 Web 服务",
     "port": 8000,
-    "command": "/data/dsh/home/test/.venv-miniconda/bin/python main.py",
-    "cwd": "/data/dsh/home/test/virtual-chat-group/backend"
+    "command": "/usr/bin/node /opt/myapp/server.js",
+    "cwd": "/opt/myapp",
+    "autoStart": false,
+    "note": "主站，对外 example.com"
   },
   {
-    "name": "easy下载",
+    "name": "静态文件服务器",
     "port": 8080,
-    "command": "/data/dsh/home/test/.venv-miniconda/bin/python -m http.server 8080",
-    "cwd": "/"
+    "command": "/usr/bin/python3 -m http.server 8080 --bind 0.0.0.0",
+    "cwd": "/var/www",
+    "autoStart": false,
+    "note": "临时预览用的静态站点"
+  },
+  {
+    "name": "反向隧道守护",
+    "port": null,
+    "command": "bash /opt/scripts/tunnel.sh",
+    "cwd": "/opt/scripts",
+    "autoStart": true,
+    "note": "无端口服务示例：ssh -R 守护脚本"
   }
 ]

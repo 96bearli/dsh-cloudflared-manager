@@ -1114,6 +1114,317 @@ window.__ModuleLoader__.load({
         }
 
 
+        // ── 由 status 派生的渲染期变量 ──
+        const nt = status && status.namedTunnel
+        const services = (status && status.services) || []
+        const maps = (status && status.quickTunnels) || []
+        const ingress = ((nt && nt.ingress) || []).filter((e) => e.hostname)
+        // 可自选的首级域名（host 端白名单）。host 未返回时是空数组（不回退到任何具体域名）
+        const zoneWhitelist = (status && status.zoneWhitelist) || []
+        const ca = status && status.cfApi
+        const cf = status && status.cloudflared
+        const namedRunning = !!(nt && nt.running)
+        const namedHealthy = !!(nt && nt.healthy)
+        const dnsOn = !!(ca && ca.tokenSet)
+
+        // 备注小窗：点服务名弹出，纯展示「名称 :端口 + 一句话用途」，点外面消失。
+        // 备注的修改统一走「编辑」表单（新增/编辑时都能填），小窗里不放按钮。
+        // 定位用 fixed + 屏幕坐标，并做边界收敛（窄面板靠右/靠底也不会跑出视口）。
+        const renderNotePop = () => {
+          if (!notePop) return null
+          const svc = services.find((x) => x.name === notePop.name) || { name: notePop.name }
+          const W = 260
+          const vw = (typeof window !== 'undefined' && window.innerWidth) || 1024
+          const vh = (typeof window !== 'undefined' && window.innerHeight) || 768
+          const left = Math.max(8, Math.min(notePop.x, vw - W - 12))
+          // 小窗高约 96，靠底时向上翻转，避免被视口截断
+          const est = 96
+          const top = (notePop.y + est > vh - 8) ? Math.max(8, notePop.y - est - 28) : notePop.y
+          return React.createElement('div', {
+            ref: notePopRef,
+            className: 'dshcf-note-pop',
+            style: { left: left, top: top, width: W },
+          },
+            React.createElement('div', { className: 'dshcf-note-pop-title' },
+              svc.name,
+              svc.port ? React.createElement('span', { className: 'dshcf-note-pop-port' }, ':' + svc.port) : null,
+            ),
+            React.createElement('div', { className: 'dshcf-note-pop-body' },
+              svc.note || '（还没有备注，可在「编辑」里填写）'),
+          )
+        }
+
+        const renderNamedTab = () => React.createElement(React.Fragment, null,
+          ingress.length === 0
+            ? React.createElement('div', { className: 'dshcf-emptybox' },
+                React.createElement('div', { className: 'dshcf-emptybox-icon' }, '🌐'),
+                React.createElement('div', null, '暂无域名映射'),
+                React.createElement('div', { className: 'dshcf-tip', style: { marginTop: 4 } }, '新增 hostname → 本地服务 的映射后，即可通过公网域名访问本地服务'),
+              )
+            : ingress.map((e) =>
+                editHost === e.hostname
+                  ? React.createElement('div', { key: e.hostname, className: 'dshcf-item' },
+                      React.createElement('span', { className: 'dshcf-item-name' }, e.hostname),
+                      React.createElement('div', { className: 'dshcf-edit-row' },
+                        React.createElement('input', { value: editSvc, onChange: (ev) => setEditSvc(ev.target.value), placeholder: 'http://localhost:端口' }),
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm dshcf-btn-primary', onClick: () => updateNamed(e.hostname), disabled: busy }, '保存'),
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm', onClick: () => { setEditHost(null); setEditSvc('') } }, '取消'),
+                      ),
+                    )
+                  : React.createElement('div', { key: e.hostname, className: 'dshcf-item' },
+                      React.createElement('div', { className: 'dshcf-item-main' },
+                        React.createElement('a', { className: 'dshcf-item-name dshcf-url', href: 'https://' + e.hostname, target: '_blank', rel: 'noopener' }, e.hostname),
+                        React.createElement('div', { className: 'dshcf-item-sub' }, e.service),
+                      ),
+                      // apex 为 null 说明该 hostname 不在白名单内的任何首级域名下
+                      // ——历史上"建歪"的记录（hostname 被错误当成别的 zone 的子域）会落到这里，
+                      // 显式标红提示，避免又被当成正常映射留着。
+                      e.apex
+                        ? React.createElement('span', { className: 'dshcf-badge dshcf-badge-off', title: '该映射所在的 Cloudflare zone' }, e.apex)
+                        : React.createElement('span', { className: 'dshcf-badge dshcf-badge-warn', title: '该域名的首级域名不在可自选范围内，DNS 很可能没建对' }, '域名异常'),
+                      React.createElement('div', { className: 'dshcf-item-actions' },
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm', onClick: () => { setEditHost(e.hostname); setEditSvc(e.service) }, disabled: busy }, '编辑'),
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm dshcf-btn-danger', onClick: () => {
+                          const pm = String(e.service || '').match(/:\d+/)
+                          const port = pm ? pm[0].replace(':', '') : null
+                          const svc = port ? (services.find((x) => x.port === parseInt(port, 10)) || null) : null
+                          setConfirmDel({ type: 'named', hostname: e.hostname, rmSvc: true, svcName: svc ? svc.name : null, port })
+                        }, disabled: busy }, '删除'),
+                      ),
+                    ),
+              ),
+          !namedAddOpen
+            ? React.createElement('button', { className: 'dshcf-add-toggle', onClick: () => setNamedAddOpen(true) }, '＋ 新增映射')
+            : React.createElement('div', { className: 'dshcf-formcard' },
+                // 子域名 + 首级域名 分开填：首级域名从后端白名单里选，
+                // 拼接由前端负责，从根上避免"把 A 域名的记录建到 B 域名的 zone 下"。
+                React.createElement('div', { className: 'dshcf-add' },
+                  React.createElement('input', {
+                    className: 'dshcf-w2', autoFocus: true,
+                    placeholder: '子域名，如 fb（也可直接粘贴完整域名）',
+                    value: newHost, onChange: (e) => setNewHost(e.target.value),
+                  }),
+                  React.createElement('select', {
+                    className: 'dshcf-w1',
+                    value: newApex || zoneWhitelist[0],
+                    onChange: (e) => setNewApex(e.target.value),
+                    title: '选择该子域名挂在哪张 Cloudflare zone 下',
+                  },
+                    zoneWhitelist.map((z) => React.createElement('option', { key: z, value: z }, '.' + z)),
+                  ),
+                ),
+                React.createElement('div', { className: 'dshcf-add' },
+                  React.createElement('input', { className: 'dshcf-w2', placeholder: 'service，如 http://localhost:8080', value: newSvc, onChange: (e) => setNewSvc(e.target.value) }),
+                ),
+                React.createElement('div', { className: 'dshcf-add' },
+                  React.createElement('select', { className: 'dshcf-w3', onChange: (e) => { if (e.target.value) setNewSvc('http://localhost:' + e.target.value) } },
+                    React.createElement('option', { value: '' }, '从本地服务选端口…'),
+                    services.filter((x) => x.port).map((x) => React.createElement('option', { key: x.name, value: x.port }, x.name + '（:' + x.port + '）')),
+                  ),
+                  React.createElement('button', { className: 'dshcf-btn dshcf-btn-primary', onClick: addNamed, disabled: busy }, busy ? '处理中…' : '＋ 新增'),
+                  React.createElement('button', { className: 'dshcf-btn', onClick: () => { setNamedAddOpen(false); setNewHost(''); setNewSvc('') } }, '收起'),
+                ),
+                React.createElement('div', { className: 'dshcf-tip' },
+                  '将创建：' + ((newHost.trim() && newHost.indexOf('.') < 0)
+                    ? newHost.trim() + '.' + (newApex || zoneWhitelist[0])
+                    : (newHost.trim() || '<子域名>')) +
+                  '　·　新增/修改会写入 config.yml 并自动重载隧道；已配置 API Token 时自动在对应 zone 创建/删除 DNS 记录（CNAME → ' + ((nt && nt.tunnelId) || '') + '.cfargotunnel.com）。'),
+              ),
+        )
+
+        // ══════════════ 源码查看/编辑器（独立视图，铺满内容区） ══════════════
+        //
+        // 由本地服务条目的「源码」按钮进入；页签条保持完整可见，点任一页签即回到列表。
+        // 读写走 dsh-file-manager 的 /dsh-fm/api，本插件 host 端零改动。
+        const renderSourceView = () => React.createElement(React.Fragment, null,
+          React.createElement('div', { className: 'dshcf-src-head' },
+            React.createElement('button', {
+              className: 'dshcf-btn dshcf-btn-sm',
+              onClick: closeSource,
+              title: '返回本地服务列表',
+            }, '← 返回'),
+            React.createElement('span', null, '📝 ' + srcSvc),
+            srcDirty ? React.createElement('span', { className: 'dshcf-src-dirty' }, '● 未保存') : null,
+            React.createElement('span', { className: 'dshcf-drawer-spacer' }),
+            React.createElement('button', {
+              className: 'dshcf-btn dshcf-btn-sm dshcf-btn-primary',
+              onClick: saveSource, disabled: busy || srcLoading || !srcPath || !srcDirty,
+              title: '保存（Ctrl/Cmd+S）；改完需回列表点该服务的「重启」生效',
+            }, busy ? '保存中…' : '保存'),
+            React.createElement('button', {
+              className: 'dshcf-btn dshcf-btn-sm',
+              onClick: () => openSourceFile(srcPath), disabled: busy || srcLoading || !srcPath,
+              title: '放弃改动并重新读取磁盘内容',
+            }, '⟳ 重读'),
+          ),
+          // 第二行：完整路径（可换行，窄栏下不会被截断成一个文件名）
+          React.createElement('div', { className: 'dshcf-src-pathrow' },
+            React.createElement('span', { className: 'dshcf-src-path', title: srcPath || '' },
+              srcPath || '（未选择文件）'),
+          ),
+          // 第三行：文件选择（下拉 + 手输路径）
+          React.createElement('div', { className: 'dshcf-src-cands' },
+            React.createElement('select', {
+              className: 'dshcf-src-select',
+              value: srcCands.some((c) => c.path === srcPath) ? srcPath : '',
+              onChange: (e) => {
+                const p = e.target.value
+                if (!p || p === srcPath) return
+                if (srcDirty && !window.confirm('「' + srcPath + '」有未保存的修改，切换文件将丢弃，继续？')) return
+                openSourceFile(p)
+              },
+              title: '从启动命令与工作目录里识别出的源码文件',
+            },
+              srcCands.length === 0
+                ? React.createElement('option', { value: '' }, '（未识别到候选文件）')
+                : null,
+              srcCands.some((c) => c.path === srcPath)
+                ? null
+                : React.createElement('option', { value: '' }, srcPath ? '（手动路径）' : '选择文件…'),
+              React.createElement('optgroup', { label: '启动命令中的文件' },
+                srcCands.filter((c) => c.from === 'cmd').map((c) =>
+                  React.createElement('option', { key: c.path, value: c.path, title: c.path }, c.path.split('/').pop())),
+              ),
+              React.createElement('optgroup', { label: '工作目录下的源码文件' },
+                srcCands.filter((c) => c.from !== 'cmd').map((c) =>
+                  React.createElement('option', { key: c.path, value: c.path, title: c.path }, c.path.split('/').pop())),
+              ),
+            ),
+            React.createElement('input', {
+              className: 'dshcf-src-pathinput',
+              placeholder: '或输入绝对路径，回车打开',
+              defaultValue: '',
+              title: '打开候选之外的文件（支持任意可读绝对路径）',
+              onKeyDown: (e) => {
+                if (e.key !== 'Enter') return
+                const p = String(e.target.value || '').trim()
+                if (!p) return
+                if (srcDirty && !window.confirm('「' + srcPath + '」有未保存的修改，切换文件将丢弃，继续？')) return
+                e.target.value = ''
+                openSourceFile(p)
+              },
+            }),
+          ),
+          srcError ? React.createElement('div', { className: 'dshcf-warnbar' }, '⚠ ' + srcError) : null,
+          // 编辑区：左侧行号 + 右侧 textarea（滚动同步）
+          srcPath
+            ? React.createElement('div', { className: 'dshcf-src-body' },
+                React.createElement('pre', { className: 'dshcf-src-gutter', ref: srcGutterRef }, srcLineNumbers),
+                React.createElement('textarea', {
+                  className: 'dshcf-src-area',
+                  ref: srcAreaRef,
+                  value: srcLoading ? '（加载中…）' : srcText,
+                  placeholder: srcLoading ? '' : '（空文件）',
+                  spellCheck: false,
+                  readOnly: srcLoading,
+                  onChange: (e) => setSrcText(e.target.value),
+                  onKeyDown: onSrcKeyDown,
+                  onScroll: onSrcScroll,
+                }),
+              )
+            : React.createElement('div', { className: 'dshcf-src-empty' },
+                React.createElement('div', { style: { fontSize: 20 } }, '🔍'),
+                React.createElement('div', null, '没能从启动命令里认出脚本文件'),
+                React.createElement('div', { className: 'dshcf-tip', style: { maxWidth: 420 } },
+                  '可在下方选工作目录里的文件，或先到该服务的「编辑」里把命令写成带脚本路径的形式（如 /path/python main.py）。'),
+              ),
+        )
+
+
+        const renderSvcTab = () => React.createElement(React.Fragment, null,
+          services.length === 0
+            ? React.createElement('div', { className: 'dshcf-emptybox' },
+                React.createElement('div', { className: 'dshcf-emptybox-icon' }, '🧩'),
+                React.createElement('div', null, '暂无服务定义'),
+                React.createElement('div', { className: 'dshcf-tip', style: { marginTop: 4 } }, '添加服务（名称 + 端口 + 启动命令）后即可在此启停，并在「域名映射」中暴露出去'),
+              )
+            : services.map((s) =>
+                editSvcName === s.name
+                  ? React.createElement('div', { key: s.name, className: 'dshcf-item' },
+                      React.createElement('span', { className: 'dshcf-item-name' }, s.name),
+                      React.createElement('div', { className: 'dshcf-edit-row' },
+                        React.createElement('input', { style: { width: 70 }, value: editSvcForm.port, onChange: (e) => setEditSvcForm({ ...editSvcForm, port: e.target.value }), placeholder: '端口' }),
+                        React.createElement('input', { style: { width: 180 }, value: editSvcForm.command, onChange: (e) => setEditSvcForm({ ...editSvcForm, command: e.target.value }), placeholder: '启动命令' }),
+                        React.createElement('input', { style: { width: 120 }, value: editSvcForm.cwd, onChange: (e) => setEditSvcForm({ ...editSvcForm, cwd: e.target.value }), placeholder: '工作目录' }),
+                        React.createElement('input', { style: { width: 200 }, value: editSvcForm.note || '', onChange: (e) => setEditSvcForm({ ...editSvcForm, note: e.target.value }), placeholder: '备注（简短用途，可留空）' }),
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm dshcf-btn-primary', onClick: () => saveEditSvc(s.name), disabled: busy }, '保存'),
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm', onClick: () => { setEditSvcName(null); setEditSvcForm({}) } }, '取消'),
+                      ),
+                    )
+                  : React.createElement('div', { key: s.name, className: 'dshcf-item' },
+                      React.createElement('span', { className: 'dshcf-badge ' + (s.running ? 'dshcf-badge-on' : 'dshcf-badge-off') }, s.running ? '● 运行' : '○ 停止'),
+                      React.createElement('div', { className: 'dshcf-item-main' },
+                        // 服务名做成按钮：点它弹备注小窗（点小窗外面消失）
+                        React.createElement('div', { className: 'dshcf-item-name' },
+                          React.createElement('button', {
+                            className: 'dshcf-note-btn',
+                            'data-dshcf-note-btn': s.name,
+                            title: '点击查看备注',
+                            onClick: (e) => {
+                              const r = e.currentTarget.getBoundingClientRect()
+                              // 已经开在同一个服务上 → 再点一次收起
+                              if (notePop && notePop.name === s.name) { setNotePop(null); return }
+                              setNotePop({ name: s.name, x: r.left, y: r.bottom + 4 })
+                            },
+                          }, s.name + (s.port ? '  :' + s.port : '')),
+                        ),
+                        // 备注不在列表里显示，只在点名字弹出的小窗里看
+                        React.createElement('div', { className: 'dshcf-item-sub' }, s.command),
+                      ),
+                      React.createElement('div', { className: 'dshcf-item-actions' },
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm', onClick: () => startSvc(s.name), disabled: busy }, '启动'),
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm dshcf-btn-danger', onClick: () => stopSvc(s.name), disabled: busy || !s.running }, '停止'),
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm', onClick: () => restartSvc(s.name), disabled: busy }, '重启'),
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm', onClick: () => viewLog(s.name), disabled: busy }, '日志'),
+                        // 源码查看/编辑：按启动命令与 cwd 自动定位脚本文件
+                        React.createElement('button', {
+                          className: 'dshcf-btn dshcf-btn-sm',
+                          onClick: () => openSource(s),
+                          disabled: busy,
+                          title: '查看/编辑该服务的启动脚本源码',
+                        }, '源码'),
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm', onClick: () => startEditSvc(s), disabled: busy }, '编辑'),
+                        React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm dshcf-btn-danger', onClick: () => setConfirmDel({ type: 'svc', name: s.name, running: s.running, stopToo: true }), disabled: busy }, '删除'),
+                      ),
+                      React.createElement('div', { style: { width: '100%', marginTop: 4, paddingTop: 4, borderTop: '1px dashed var(--dsw-alias-border-l1)' } },
+                        React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 11 } },
+                          React.createElement('input', { type: 'checkbox', checked: !!autoStartSvcs[s.name], onChange: (e) => setSvcAutoStart(s.name, e.target.checked), disabled: busy }),
+                          '随 DSH 自动启动',
+                        ),
+                      ),
+                    ),
+              ),
+          !svcAddOpen
+            ? React.createElement('button', { className: 'dshcf-add-toggle', onClick: () => setSvcAddOpen(true) }, '＋ 新增服务')
+            : React.createElement('div', { className: 'dshcf-formcard' },
+                React.createElement('div', { className: 'dshcf-add' },
+                  React.createElement('input', { className: 'dshcf-w1', autoFocus: true, placeholder: '服务名', value: svcForm.name, onChange: (e) => setSvcForm({ ...svcForm, name: e.target.value }) }),
+                  React.createElement('input', { className: 'dshcf-w3', placeholder: '端口', value: svcForm.port, onChange: (e) => setSvcForm({ ...svcForm, port: e.target.value }) }),
+                  React.createElement('select', { className: 'dshcf-w3', onChange: (e) => { if (e.target.value) setSvcForm({ ...svcForm, port: e.target.value }) } },
+                    React.createElement('option', { value: '' }, '选映射端口…'),
+                    ingress.map((x) => { const m = String(x.service || '').match(/:(\d+)/); return m ? m[1] : null }).filter(Boolean).map((port) => React.createElement('option', { key: port, value: port }, '映射 :' + port)),
+                  ),
+                ),
+                React.createElement('div', { className: 'dshcf-add' },
+                  React.createElement('input', { className: 'dshcf-w2', placeholder: '启动命令，如 /path/python main.py', value: svcForm.command, onChange: (e) => setSvcForm({ ...svcForm, command: e.target.value }) }),
+                  React.createElement('input', { className: 'dshcf-w2', placeholder: '工作目录，如 /data/app', value: svcForm.cwd, onChange: (e) => setSvcForm({ ...svcForm, cwd: e.target.value }) }),
+                ),
+                React.createElement('div', { className: 'dshcf-add' },
+                  React.createElement('input', {
+                    className: 'dshcf-w2',
+                    placeholder: '备注：一句话说清用途，如「美国出口代理 :8080」',
+                    value: svcForm.note || '',
+                    onChange: (e) => setSvcForm({ ...svcForm, note: e.target.value }),
+                  }),
+                ),
+                React.createElement('div', { className: 'dshcf-add' },
+                  React.createElement('button', { className: 'dshcf-btn dshcf-btn-primary', onClick: addSvc, disabled: busy }, busy ? '处理中…' : '＋ 新增服务'),
+                  React.createElement('button', { className: 'dshcf-btn', onClick: () => { setSvcAddOpen(false); setSvcForm({ name: '', port: '', command: '', cwd: '/' }) } }, '收起'),
+                ),
+                React.createElement('div', { className: 'dshcf-tip' }, '启动命令需写完整路径（面板环境的 PATH 不保证覆盖，如 /path/python main.py）；端口用于探活，可留空。'),
+              ),
+        )
+
         const renderQuickTab = () => React.createElement(React.Fragment, null,
           maps.length === 0
             ? React.createElement('div', { className: 'dshcf-emptybox' },

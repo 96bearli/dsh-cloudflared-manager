@@ -28,7 +28,7 @@
 **快速隧道（trycloudflare）**
 
 - 无需 Cloudflare 账号，一条命令把本地端口暴露到临时公网 URL
-- 面板自动生成改写代理地址（直连 `trycloudflare.com` 在部分网络下不可达）
+- 可选 URL 改写代理：直连 `trycloudflare.com` 在部分网络下不可达时，可配置自己的代理前缀，面板会额外给出代理地址（默认关闭）
 
 ---
 

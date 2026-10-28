@@ -7,7 +7,7 @@
 //     ls-tunnel-list / ls-tunnel-add / ls-tunnel-stop     （trycloudflare 快速隧道）
 export const inject = ['shell', 'webServer']
 
-const CF_SETUP = '/data/dsh/home/test/cloudflared-setup'
+const CF_SETUP = process.env.DSH_CF_SETUP || ((process.env.DSH_HOME || '/data/dsh') + '/cloudflared-setup')
 const CLOUDFLARED_BIN = CF_SETUP + '/node_modules/@farthershore/cloudflared-linux-x64/bin/cloudflared'
 const SERVICES_FILE = CF_SETUP + '/services.json'
 const PIDS_DIR = CF_SETUP + '/pids'
@@ -29,7 +29,7 @@ export function apply(ctx) {
     const chk = await sh(`test -x ${CLOUDFLARED_BIN} && echo yes || echo no`, 5000)
     if ((chk.output || '').includes('yes')) return { ok: true, installed: true }
     const inst = await sh(
-      `mkdir -p ${CF_SETUP} && cd ${CF_SETUP} && npm install --cache /data/dsh/home/test/.npm-cache @farthershore/cloudflared-linux-x64 2>&1 | tail -3`,
+      `mkdir -p ${CF_SETUP} && cd ${CF_SETUP} && npm install --cache ${CF_SETUP}/.npm-cache @farthershore/cloudflared-linux-x64 2>&1 | tail -3`,
       180000,
     )
     const chk2 = await sh(`test -x ${CLOUDFLARED_BIN} && echo yes || echo no`, 5000)

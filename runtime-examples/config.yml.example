@@ -1,10 +1,21 @@
-# Named 隧道配置模板（config.yml）——脱敏
-# 说明：本插件对 "remotely-managed 隧道"（token 创建）实际以"云端配置"为准（见 README），
-#       此文件作为本地备份/降级；插件增删映射时会同步写本地 + 云端 PUT。
-# TUNNEL_ID 为你的隧道 UUID（Cloudflare 控制台 或 token 解出的 "t" 字段）。
-tunnel: YOUR_TUNNEL_ID
-credentials-file: /data/dsh/home/test/cloudflared-setup/credentials.json
+# Named 隧道配置模板（config.yml）
+#
+# 说明：本插件对 "remotely-managed 隧道"（token 创建）实际以「云端配置」为准，
+#       此文件作为本地备份 / 降级使用；插件增删映射时会同步写本地 + 云端 PUT。
+#
+# 字段：
+#   tunnel            你的隧道 UUID（Cloudflare 控制台 Zero Trust → Tunnels 可见）
+#   credentials-file  隧道凭证文件路径（由 cloudflared 生成，含密钥，勿提交）
+#   ingress           映射规则列表，**最后一条必须是无 hostname 的兜底规则**
+#
+# 用法：复制为 <DSH_HOME>/cloudflared-setup/config.yml 后按需修改。
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: /data/dsh/cloudflared-setup/credentials.json
 ingress:
-  - hostname: tempwebserver.example.com
+  # hostname → 本地服务，按顺序匹配
+  - hostname: app.example.com
     service: http://localhost:8000
+  - hostname: api.example.com
+    service: http://localhost:3000
+  # 兜底：未匹配的请求返回 404
   - service: http_status:404
