@@ -137,9 +137,34 @@ $DSH_HOME/cloudflared-setup/
    - Account → Cloudflare Tunnel → Edit
 2. **Account ID**：控制台右侧栏，或任意 zone 的 URL 里那串 32 位十六进制。
 3. **Tunnel ID**：Zero Trust → Networks → Tunnels 里点进隧道可见。
-4. **Zone 白名单**：填你要用的根域名，如 `example.com`。
+4. **根域名白名单**：填你要用的根域名，如 `example.com`（不要填子域名）。
 
-也可以在面板的「设置 → Cloudflared 隧道」页签里填写，不用手动改 JSON。
+也可以在面板的「设置 → Cloudflared 隧道」页签里填写，不用手动改 JSON：
+设置页有独立的「根域名白名单」区，可逐个添加/移除，并点「校验可用性」现场确认
+每个域名能否写 DNS。
+
+> **不需要填 Zone ID。** 插件按域名后缀自动解析对应的 zone（要求 Token 有
+> Zone:Read 权限）。`zoneId` 字段已废弃：旧版用它做「解析不出 zone 时」的兜底
+> 放行，但单个 zoneId 只能对应一个 zone，拿它去建另一个首级域名的记录会让
+> Cloudflare 把 hostname 当成该 zone 的子域（落库成 `xxx.other.tld`），
+> 正是历史上「映射建歪」的成因。现在白名单是唯一边界。
+
+### 关于 DNS 与 ingress 的一致性
+
+新增/删除映射都是**两步且非原子**：
+
+- 新增：先写 tunnel ingress，再建 DNS CNAME
+- 删除：先删 ingress，再删 DNS CNAME
+
+如果第二步失败（例如 Token 缺 Zone:DNS 权限），会出现半完成状态并留下痕迹：
+
+| 场景 | 后果 |
+|---|---|
+| 新增时 DNS 失败 | 映射已在隧道里，但域名解析不到 —— 访问无响应 |
+| 删除时 DNS 失败 | Cloudflare 里残留一条指向 `xxx.cfargotunnel.com` 的 CNAME |
+
+面板会明确报出这类情况（而不是笼统显示"成功"）。看到提示后请到 Cloudflare
+DNS 面板核对并手动清理，否则残留记录会一直指向已失效的映射。
 
 ---
 

@@ -1,23 +1,30 @@
 # Cloudflare API 配置模板（cf_config.json）
 #
-# 用法：复制为 <DSH_HOME>/cloudflared-setup/cf_config.json 后填入真实值。
+# 用法：复制为 <DSH_HOME>/cloudflared-setup/cf_config.json 后填入真实值；
+#       也可直接在 DSH 设置 →「Cloudflared 隧道」里填写（推荐，保存即生效）。
 # 该文件含密钥，权限应为 600，且**绝不可提交到 git**（已在 .gitignore 中）。
 #
 # 字段说明：
 #   apiToken       Cloudflare API Token。权限需含：
 #                    Zone → DNS:Edit（增删改映射时自动同步 CNAME）
-#                    Zone → Zone:Read（按 hostname 后缀自动解析 zoneId）
+#                    Zone → Zone:Read（按域名后缀自动解析对应的 zone）
 #                    Account → Cloudflare Tunnel:Edit（读写云端 ingress 配置）
-#   zoneId         可选。默认由插件按 hostname 后缀 + zoneWhitelist 自动解析；
-#                  仅当 token 没有 Zone:Read 时才需要手动指定。
-#   tunnelId       你的 Named 隧道 ID（dash.cloudflare.com → Zero Trust → Tunnels 里可查）。
-#   accountId      你的 Cloudflare 账号 ID（控制台右侧栏 / URL 中可见）。
-#   zoneWhitelist  允许操作的根域名列表。安全边界：防止误把记录建到不相干的 zone。
+#   tunnelId       你的 Named 隧道 ID（one.dash.cloudflare.com → Networks → Tunnels）。
+#   accountId      你的 Cloudflare 账号 ID（控制台右侧栏 / 地址栏中的 UUID）。
+#   zoneWhitelist  根域名白名单，**这是唯一的域名边界**：只有命中白名单的
+#                  hostname 才允许建映射；按最长后缀匹配（a.b.example.com 归
+#                  example.com）。解析不出 apex 的域名一律拒绝，不做猜测。
 #                  例如 ["example.com", "example.net"]
 #   autoStart      DSH 启动时是否自动拉起 Named 隧道（true/false）。
+#
+# 关于 zoneId（已废弃）：
+#   早期版本有 zoneId 字段，用作「域名解析不出 zone 时」的兜底放行。
+#   该行为已移除 —— 单个 zoneId 只能对应一个 zone，拿它去建另一个首级域名的
+#   记录，Cloudflare 会把 hostname 当成该 zone 的子域，落库成 xxx.other.tld，
+#   正是历史上「映射建歪」的成因。现在 zone 一律按域名后缀自动解析，
+#   白名单是唯一边界。老配置文件里的 zoneId 字段会被忽略。
 {
   "apiToken": "YOUR_CLOUDFLARE_API_TOKEN",
-  "zoneId": null,
   "tunnelId": "YOUR_TUNNEL_UUID",
   "accountId": "YOUR_ACCOUNT_ID",
   "zoneWhitelist": ["example.com"],

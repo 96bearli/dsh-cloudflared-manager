@@ -17,7 +17,7 @@ import fs from 'node:fs'
 
 export const inject = ['shell', 'webServer']
 
-const PLUGIN_VERSION = '1.4.0'
+const PLUGIN_VERSION = '1.5.0'
 // ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
 //
 // 解析顺序：
@@ -560,8 +560,17 @@ export function apply(ctx) {
   // 按 hostname 取 zone id（带进程内缓存，避免面板刷新时反复打 CF API）
   //
   // 缓存键是 apex，不是"唯一 zoneId"——这是与旧 getZoneId 的关键区别。
-  // 旧的 cfg.zoneId 字段保留：它仍是 cf-cfg-set / cf-cfg-test 的显式覆盖值，
-  // 只在 hostname 解析不出 apex 时作为兜底使用（保持向后兼容）。
+  // ⚠ 2026-10-28 变更：**移除 cfg.zoneId 兜底放行**。
+  //
+  //   旧行为：hostname 不在白名单里时，只要配了 cfg.zoneId 就放行，拿这个
+  //   zoneId 去建 DNS 记录。这是个安全隐患 + 建歪的根源：
+  //     · 白名单本来是安全边界，却被这个兜底开了个后门；
+  //     · 单个全局 zoneId 只能对应一个 zone。若拿它去建另一个首级域名的
+  //       记录，CF 会把 hostname 当该 zone 的子域，落库成 `xxx.other.tld`
+  //       —— 正是历史上「映射建歪」事故的成因。
+  //   现在：白名单是**唯一**边界。解析不出 apex 就明确拒绝，不做任何猜测。
+  //   zoneId 字段不再参与任何判定（保留读取仅为向后兼容老配置文件，
+  //   不再用于放行）。
   const zoneIdCache = new Map()   // apex -> zoneId
 
   async function getZoneIdForHost(cfg, hostname) {
@@ -576,11 +585,13 @@ export function apply(ctx) {
       }
       return { zoneId: null, apex, error: `无法解析 ${apex} 的 Zone（Token 是否有 Zone:Read？）` }
     }
-    // 白名单外：仅在显式配了 zoneId 时放行（旧行为），否则明确拒绝
-    if (cfg.zoneId) return { zoneId: cfg.zoneId, apex: null }
+    // 白名单外一律拒绝。不再用 cfg.zoneId 兜底。
+    const list = ZONE_WHITELIST()
     return {
       zoneId: null, apex: null,
-      error: `域名不在可自选范围内（仅支持 ${ZONE_WHITELIST().map((z) => 'xxx.' + z).join(' / ')}）`,
+      error: list.length === 0
+        ? '尚未配置根域名白名单：请先在「设置」里添加可用的根域名（如 example.com）'
+        : `域名不在白名单内（仅支持 ${list.map((z) => 'xxx.' + z).join(' / ')}）`,
     }
   }
 
@@ -1075,7 +1086,7 @@ export function apply(ctx) {
             services: svcList,
             quickTunnels: maps,
             binPath: CLOUDFLARED_BIN,
-            cfApi: { tokenSet: !!(cfg.apiToken), zoneId: cfg.zoneId || null },
+            cfApi: { tokenSet: !!(cfg.apiToken) },
             // 快速隧道的 URL 改写代理前缀：前端据此决定是显示代理地址还是「未配置」。
             // 放在 cf-status 里一起返回，避免面板每轮刷新再多打一次接口。
             proxyPrefix: typeof cfg.proxyPrefix === 'string' ? cfg.proxyPrefix : '',
@@ -1085,15 +1096,54 @@ export function apply(ctx) {
           }
         } else if (method === 'cf-cfg-get') {
           const cfg = await readCfConfig()
-          return { apiToken: cfg.apiToken || '', zoneId: cfg.zoneId || null, tokenSet: !!(cfg.apiToken), autoStart: !!cfg.autoStart }
+          return { apiToken: cfg.apiToken || '', tokenSet: !!(cfg.apiToken), autoStart: !!cfg.autoStart }
+        } else if (method === 'cf-whitelist-add') {
+          // 单独增删根域名白名单：**不要求已配 API Token**，
+          // 因为白名单本身是本地安全边界，与 token 无关。
+          // （cf-cfg-set 会因为没 token 直接拒绝，不能复用它做这件事。）
+          const raw = typeof args.apex === 'string' ? args.apex.trim() : ''
+          if (!raw) return { error: '根域名不能为空' }
+          // 归一化：去协议、去路径、去通配、去尾点、转小写。
+          // 用户常从浏览器地址栏直接粘贴 https://example.com/xxx 或 *.example.com，
+          // 这里统一清洗，避免存进去一个永远匹配不上的串。
+          const apex = raw
+            .replace(/^[a-z]+:\/\//i, '')
+            .replace(/\/.*$/, '')
+            .replace(/^\*\./, '')
+            .replace(/\.$/, '')
+            .toLowerCase()
+          // 只接受「域名」形态：至少两段、只含字母数字连字符与点，且不含端口/空格。
+          // 不做严格的 TLD 校验（内网/测试域名也常见），但必须能当 hostname 后缀用。
+          if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(apex)) {
+            return { error: `不像一个根域名：${raw}（示例：example.com）` }
+          }
+          const cfg = await readCfConfig()
+          const list = Array.isArray(cfg.zoneWhitelist) ? cfg.zoneWhitelist : []
+          if (list.includes(apex)) return { ok: true, apex, zoneWhitelist: list, already: true }
+          list.push(apex)
+          cfg.zoneWhitelist = list
+          await writeCfConfig(cfg)
+          await refreshCfMeta()
+          zoneIdCache.clear()
+          return { ok: true, apex, zoneWhitelist: cfMeta.zoneWhitelist }
+        } else if (method === 'cf-whitelist-remove') {
+          const raw = typeof args.apex === 'string' ? args.apex.trim().toLowerCase() : ''
+          if (!raw) return { error: '根域名不能为空' }
+          const cfg = await readCfConfig()
+          const list = Array.isArray(cfg.zoneWhitelist) ? cfg.zoneWhitelist : []
+          const next = list.filter((z) => String(z).toLowerCase() !== raw)
+          if (next.length === list.length) return { ok: true, removed: false, zoneWhitelist: list }
+          cfg.zoneWhitelist = next
+          await writeCfConfig(cfg)
+          await refreshCfMeta()
+          zoneIdCache.clear()
+          return { ok: true, removed: true, zoneWhitelist: cfMeta.zoneWhitelist }
         } else if (method === 'cf-cfg-set') {
           const apiToken = typeof args.apiToken === 'string' ? args.apiToken.trim() : ''
-          const zoneId = typeof args.zoneId === 'string' ? args.zoneId.trim() : ''
           const cfg = await readCfConfig()
           // apiToken 允许只改账号字段而不动 token（传空串表示不修改）
           if (apiToken) cfg.apiToken = apiToken
           else if (!cfg.apiToken) return { error: '缺少 API Token' }
-          if (typeof args.zoneId !== 'undefined') cfg.zoneId = zoneId || null
           // 账号级字段（开源后由用户自己填，代码里不再硬编码）
           if (typeof args.tunnelId === 'string') cfg.tunnelId = args.tunnelId.trim()
           if (typeof args.accountId === 'string') cfg.accountId = args.accountId.trim()
@@ -1104,7 +1154,7 @@ export function apply(ctx) {
           await refreshCfMeta()
           zoneIdCache.clear()   // zone 可能变了，清掉解析缓存
           return {
-            ok: true, apiToken: '***', zoneId: cfg.zoneId || null,
+            ok: true, apiToken: '***',
             tunnelId: cfMeta.tunnelId, accountId: cfMeta.accountId, zoneWhitelist: cfMeta.zoneWhitelist,
           }
         } else if (method === 'cf-cfg-get') {
@@ -1113,7 +1163,6 @@ export function apply(ctx) {
           return {
             ok: true,
             tokenSet: !!cfg.apiToken,
-            zoneId: cfg.zoneId || null,
             tunnelId: cfMeta.tunnelId,
             accountId: cfMeta.accountId,
             zoneWhitelist: cfMeta.zoneWhitelist,
@@ -1178,7 +1227,7 @@ export function apply(ctx) {
           return {
             ok: ver.success === true && okZones.length > 0,
             tokenValid: ver.success === true,
-            zoneId: (okZones[0] && okZones[0].zoneId) || cfg.zoneId || null,
+            zoneId: (okZones[0] && okZones[0].zoneId) || null,
             dnsAccess: okZones.length > 0,
             zones,
             message: !ver.success
@@ -1235,7 +1284,7 @@ export function apply(ctx) {
           if (entries.some((e) => e.hostname === hostname)) return { error: `hostname ${hostname} 已存在` }
           entries.splice(entries.length - 1, 0, { hostname, service })
           const wr = await writeIngress(entries)
-          if (!wr.ok) return { error: '写入 config.yml 失败' }
+          if (!wr.ok) return { error: (wr && wr.error) || '写入隧道配置失败' }
           const cfg = await readCfConfig()
           const dns = cfg.apiToken ? await ensureDns(cfg, hostname) : { ok: false, error: '未配置 API Token' }
           return { ok: true, hostname, service, apex, restarted: { ok: true, autoReload: true, message: '云端配置已更新，隧道自动重载' }, dns: dns.ok ? { ok: true, apex: dns.apex || apex } : { ok: false, error: dns.error || '' } }
@@ -1248,7 +1297,7 @@ export function apply(ctx) {
           if (!e) return { error: `hostname ${hostname} 不存在` }
           e.service = service
           const wr = await writeIngress(entries)
-          if (!wr.ok) return { error: '写入 config.yml 失败' }
+          if (!wr.ok) return { error: (wr && wr.error) || '写入隧道配置失败' }
           return { ok: true, hostname, service, restarted: { ok: true, autoReload: true, message: '云端配置已更新，隧道自动重载' } }
         } else if (method === 'cf-named-delete') {
           const hostname = typeof args.hostname === 'string' ? args.hostname.trim() : ''
@@ -1257,7 +1306,7 @@ export function apply(ctx) {
           const next = entries.filter((e) => e.hostname !== hostname)
           if (next.length === entries.length) return { error: `hostname ${hostname} 不存在` }
           const wr = await writeIngress(next)
-          if (!wr.ok) return { error: '写入 config.yml 失败' }
+          if (!wr.ok) return { error: (wr && wr.error) || '写入隧道配置失败' }
           const cfg = await readCfConfig()
           const dns = cfg.apiToken ? await removeDns(cfg, hostname) : { ok: false, error: '未配置 API Token' }
           return { ok: true, hostname, deleted: true, restarted: { ok: true, autoReload: true, message: '云端配置已更新，隧道自动重载' }, dns: dns.ok ? { ok: true, apex: dns.apex || null } : { ok: false, error: dns.error || '' } }
