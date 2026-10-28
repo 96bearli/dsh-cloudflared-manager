@@ -17,7 +17,7 @@ import fs from 'node:fs'
 
 export const inject = ['shell', 'webServer']
 
-const PLUGIN_VERSION = '1.1.0'
+const PLUGIN_VERSION = '1.3.0'
 // ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
 //
 // 解析顺序：
@@ -262,9 +262,100 @@ export function apply(ctx) {
   //   改为：一次调用同时拿到「是否运行」+「连接数」，并记忆上次命中的端口
   //   （metricsPort），下次优先试它；命中后立即返回，不再遍历无关端口。
   //   实测 metrics 监听在 20241，其余两个是无效探测。
+  //
+  // ⚠ 历史 bug（2026-10-28 修复）：**快速隧道会把 Named 隧道「带活」**
+  //
+  //   快速隧道（`tunnel --url http://localhost:PORT`）启动时也会自己开一个
+  //   metrics 监听（实测 20241），并导出 cloudflared_tunnel_ha_connections=1。
+  //   而 probeMetrics() 原先只问「20241 有没有 metrics 响应」，**不问这个端口
+  //   属于哪个进程**，于是：
+  //     · 只要存在任意一条快速隧道，Named 隧道就永远显示 running/healthy=true；
+  //     · 哪怕根本没建过 Named 隧道（没有 config.yml、没有 pid、没有进程）。
+  //   实测复现：只建了一条 8099 的快速隧道，cf-status 返回
+  //   namedTunnel {running:true, healthy:true, connections:1}，而
+  //   /proc 关联显示 20241 的属主正是那条快速隧道（PID 1084）。
+  //   连带影响 cf-named-start 的「已在运行就不重复启动」判断等。
+  //
+  //   修法（按端口反查进程归属，再按命令行区分模式）：
+  //     命中 metrics 端口后，解析该端口的属主 PID，读它的 cmdline：
+  //       · 含 `--url`（快速隧道）→ 不算 Named 隧道在跑，继续试下一个候选端口；
+  //       · 含 `--config` 或 `tunnel ... run`（Named 模式）→ 才算 Named 隧道。
+  //   不做「按固定端口区分」那种改法，因为端口是 cloudflared 自选的，
+  //   而且在端口被占用时它会漂移，硬编码反而更脆。
   let metricsPort = 20241
 
-  /** 返回 { running, connections, port }；单次 shell 往返搞定 */
+  // 排障用：最近一次因「属主不是 Named 隧道」而跳过的 metrics 端口信息。
+  // 典型场景：只有快速隧道在跑时，它占着 20241 并报 ha_connections=1，
+  // 这里会记下它的 pid 与命令行，cf-status 里回传给前端，便于一眼看出
+  // 「有 quick tunnel 在跑，但它不是 Named 隧道」。
+  let metricsPortOwnerNote = null
+
+  /**
+   * 按监听端口反查属主 PID：读 /proc/net/tcp{,6} 拿到该 port 的 socket inode，
+   * 再在 /proc/<pid>/fd 里找指向同一 inode 的进程。
+   * @returns 属主 PID，找不到返回 null。纯 Node 实现（沙箱无 ss/lsof/netstat）。
+   */
+  function pidOfListeningPort(port) {
+    const inodes = new Set()
+    for (const file of ['/proc/net/tcp', '/proc/net/tcp6']) {
+      let text
+      try { text = fs.readFileSync(file, 'utf8') } catch (e) { continue }
+      for (const line of text.split('\n').slice(1)) {
+        const cols = line.trim().split(/\s+/)
+        if (cols.length < 10 || cols[3] !== '0A') continue   // 0A = LISTEN
+        const local = cols[1]
+        if (parseInt(local.split(':').pop(), 16) !== port) continue
+        inodes.add(cols[9])
+      }
+    }
+    if (inodes.size === 0) return null
+    let entries
+    try { entries = fs.readdirSync('/proc') } catch (e) { return null }
+    for (const d of entries) {
+      if (!/^\d+$/.test(d)) continue
+      let fds
+      try { fds = fs.readdirSync('/proc/' + d + '/fd') } catch (e) { continue }
+      for (const fd of fds) {
+        let link
+        try { link = fs.readlinkSync('/proc/' + d + '/fd/' + fd) } catch (e) { continue }
+        const m = /^socket:\[(\d+)\]$/.exec(link)
+        if (m && inodes.has(m[1])) return Number(d)
+      }
+    }
+    return null
+  }
+
+  /** 读取某 PID 的 cmdline（空格连接）。 */
+  function cmdlineOf(pid) {
+    try {
+      return fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8')
+        .split('\0').filter(Boolean).join(' ')
+    } catch (e) { return '' }
+  }
+
+  /**
+   * 判断某 PID 是否真的是「Named 隧道」进程。
+   *
+   * 判据：命令行是 cloudflared，且带 `tunnel` 子命令，且 **不含** `--url`
+   * （`--url` 是快速隧道的标志）。Named 隧道的形态是
+   * `cloudflared tunnel --config <path> run`。
+   */
+  function isNamedTunnelPid(pid) {
+    const cmd = cmdlineOf(pid)
+    if (!cmd) return false
+    if (!cmd.includes('cloudflared')) return false
+    if (!/\btunnel\b/.test(cmd)) return false
+    // 快速隧道：cloudflared tunnel --url http://localhost:PORT
+    if (/(^|\s)--url(\s|=|$)/.test(cmd)) return false
+    return true
+  }
+
+  /**
+   * 返回 { running, connections, port }；单次 shell 往返搞定。
+   *
+   * running 为 true 的**前提**是该 metrics 端口的属主进程确实是 Named 隧道，
+   * 否则快速隧道会被误判成 Named 隧道（见上方历史 bug 说明）。
+   */
   async function probeMetrics() {
     // 优先试上次命中的端口，再依次试其余候选
     const candidates = [metricsPort, 20241, 20242, 20243].filter((v, i, a) => a.indexOf(v) === i)
@@ -278,13 +369,24 @@ export function apply(ctx) {
         6000,
       )
       const out = r.output || ''
-      if (out.includes('UP:1')) {
-        metricsPort = port
-        const conn = parseInt((out.match(/CONN:(\d+)/) || [])[1], 10)
-        return { running: true, connections: Number.isFinite(conn) ? conn : 0, port }
+      if (!out.includes('UP:1')) continue
+
+      // 端口有 metrics 响应 ≠ Named 隧道在跑：必须核对属主进程的命令行。
+      // 属主反查失败（例如 /proc 不可读）时按「不是 Named 隧道」处理（fail-closed），
+      // 宁可漏报也不把快速隧道当成 Named 隧道。
+      const owner = pidOfListeningPort(port)
+      if (owner === null || !isNamedTunnelPid(owner)) {
+        // 是别的 cloudflared（通常是快速隧道）占着这个 metrics 端口，
+        // 记下原因便于排障，然后继续试其它候选端口。
+        if (owner !== null) metricsPortOwnerNote = { port, pid: owner, cmd: cmdlineOf(owner).slice(0, 160) }
+        continue
       }
+
+      metricsPort = port
+      const conn = parseInt((out.match(/CONN:(\d+)/) || [])[1], 10)
+      return { running: true, connections: Number.isFinite(conn) ? conn : 0, port, pid: owner }
     }
-    return { running: false, connections: 0, port: null }
+    return { running: false, connections: 0, port: null, pid: null }
   }
 
   async function isNamedRunning() {
@@ -926,6 +1028,9 @@ export function apply(ctx) {
           ])
           const running = metrics.running
           const conns = metrics.connections
+          // 只有 Named 隧道真的在跑时才展示「已连接数」；
+          // 快速隧道占着 metrics 端口时 conns 会是它的连接数，不能算到 Named 头上。
+          const namedConns = running ? conns : 0
           // ⚡ 并发探活：原先 for-await 串行，9 个服务逐个等待；
           //    改为 Promise.all 并发，避免耗时线性累加。
           const svcList = await Promise.all(services.map(async (s) => {
@@ -935,8 +1040,13 @@ export function apply(ctx) {
           return {
             cloudflared: { installed: inst.ok, installedNow: inst.installedNow || false, error: inst.error || null },
             namedTunnel: {
-              running, healthy: conns > 0, tunnelId: TUNNEL_ID(), connections: conns,
+              running, healthy: running && namedConns > 0, tunnelId: TUNNEL_ID(), connections: namedConns,
               mode: '本地 config.yml（可增删改查）',
+              // 排障信息：metrics 端口被非 Named 进程（通常是快速隧道）占用时，
+              // 说明「有 cloudflared 在跑，但它不是 Named 隧道」，前端可据此提示。
+              metricsPort: metrics.port || null,
+              metricsPid: metrics.pid || null,
+              metricsOwnerNote: metricsPortOwnerNote,
               // 每条映射带上解析出的首级域名，前端可直接展示"这个映射挂在哪个域名下"，
               // 也能一眼看出历史上的建歪记录（apex 为 null 的通常是 xxx.other.tld 形态）。
               ingress: ingress.map((e) => ({ ...e, apex: e.hostname ? resolveApex(e.hostname) : null })),
@@ -945,6 +1055,9 @@ export function apply(ctx) {
             quickTunnels: maps,
             binPath: CLOUDFLARED_BIN,
             cfApi: { tokenSet: !!(cfg.apiToken), zoneId: cfg.zoneId || null },
+            // 快速隧道的 URL 改写代理前缀：前端据此决定是显示代理地址还是「未配置」。
+            // 放在 cf-status 里一起返回，避免面板每轮刷新再多打一次接口。
+            proxyPrefix: typeof cfg.proxyPrefix === 'string' ? cfg.proxyPrefix : '',
             // 可自选的「首级域名」白名单：前端据此渲染下拉，顺序即展示顺序
             zoneWhitelist: ZONE_WHITELIST(),
             managed: Array.from(managedProcs.entries()).map(([name, st]) => ({ name, type: st.type, alive: !st.proc.killed })),
@@ -983,7 +1096,27 @@ export function apply(ctx) {
             tunnelId: cfMeta.tunnelId,
             accountId: cfMeta.accountId,
             zoneWhitelist: cfMeta.zoneWhitelist,
+            // 快速隧道的「URL 改写代理前缀」：留空表示不启用改写，只给原始直连地址。
+            proxyPrefix: typeof cfg.proxyPrefix === 'string' ? cfg.proxyPrefix : '',
           }
+        } else if (method === 'cf-proxy-prefix-get') {
+          const cfg = await readCfConfig()
+          return { ok: true, proxyPrefix: typeof cfg.proxyPrefix === 'string' ? cfg.proxyPrefix : '' }
+        } else if (method === 'cf-proxy-prefix-set') {
+          // 只改这一个字段，**不要求已配 API Token**——快速隧道本来就不需要账号，
+          // 而 cf-cfg-set 会因为没有 token 直接拒绝，不能复用它。
+          const raw = typeof args.proxyPrefix === 'string' ? args.proxyPrefix.trim() : ''
+          // 留空 = 关闭改写。非空时必须是个 http(s) URL 前缀，否则拼出来是坏链。
+          if (raw && !/^https?:\/\/\S+$/i.test(raw)) {
+            return { error: '代理前缀必须以 http:// 或 https:// 开头，或留空表示不启用' }
+          }
+          // 统一补尾部 /：否则 "https://p.example.com/https" + "xxx.trycloudflare.com"
+          // 会粘成 ".../httpsxxx.trycloudflare.com" 这种坏链（最容易踩的一处）。
+          const normalized = raw && !raw.endsWith('/') ? raw + '/' : raw
+          const cfg = await readCfConfig()
+          cfg.proxyPrefix = normalized
+          await writeCfConfig(cfg)
+          return { ok: true, proxyPrefix: normalized }
         } else if (method === 'cf-cfg-auto-start-get') {
           const cfg = await readCfConfig()
           return { autoStart: !!cfg.autoStart }

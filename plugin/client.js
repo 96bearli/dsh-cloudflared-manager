@@ -13,10 +13,14 @@ window.__ModuleLoader__.load({
     // 时，https://xxx.trycloudflare.com 会改写成
     // https://proxy.example.com/https/xxx.trycloudflare.com
     //
-    // 默认留空（不启用改写）。需要时在 DSH 设置里填，或改这一行。
-    const TUNNEL_PROXY_PREFIX = ''
-    const toProxyUrl = (u) => (TUNNEL_PROXY_PREFIX && u && /^https?:\/\//i.test(u))
-      ? TUNNEL_PROXY_PREFIX + String(u).replace(/^https?:\/\//i, '')
+    // 前缀由用户在面板「设置」页签里填写，存到 cf_config.json 的 proxyPrefix，
+    // 由 host 端 cf-status / cf-proxy-prefix-get 返回。留空 = 不启用改写
+    // （面板只给原始直连地址，并明确标注"未配置"）。
+    //
+    // ⚠ 早期版本这里是个写死的空常量，文案却说"可在面板里配置"，
+    //   用户翻遍面板也找不到入口 —— 已改为真正可配置。
+    const toProxyUrl = (u, prefix) => (prefix && u && /^https?:\/\//i.test(u))
+      ? prefix + String(u).replace(/^https?:\/\//i, '')
       : ''
 
     // 备注（note）由 host 端读写 services.json，浏览器端只通过 /dsh-cf/api 交互，
@@ -244,6 +248,11 @@ window.__ModuleLoader__.load({
   border-color: var(--dsw-alias-brand-primary);
 }
 .dshcf-formcard .dshcf-add { margin-top: 0; }
+.dshcf-formcard-title {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 12px; font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
 
 /* 表单行与输入（面板 + 设置页共用） */
 .dshcf-add { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
@@ -730,6 +739,11 @@ window.__ModuleLoader__.load({
         const [autoStartNamed, setAutoStartNamed] = React.useState(false)
         const [autoStartSvcs, setAutoStartSvcs] = React.useState({})
 
+        // 快速隧道的「URL 改写代理前缀」编辑态。
+        // proxyEditing: 是否展开输入框；proxyDraft: 正在编辑的值（保存前不生效）
+        const [proxyEditing, setProxyEditing] = React.useState(false)
+        const [proxyDraft, setProxyDraft] = React.useState('')
+
         // ── 源码查看/编辑器 ──
         // srcSvc: 当前打开的服务名（null = 抽屉关闭）
         // srcPath: 正在编辑的文件绝对路径
@@ -879,6 +893,32 @@ window.__ModuleLoader__.load({
             await navigator.clipboard.writeText(t)
             flash('已复制：' + t)
           } catch (e) { flash('复制失败，请手动复制', 'err') }
+        }
+
+        // 保存快速隧道的 URL 改写代理前缀。
+        // 前端不做 URL 校验，交给 host 端统一校验（get/set 用的是同一套规则），
+        // 这样面板提示与真实行为不会出现两套判断。
+        const saveProxyPrefix = async () => {
+          setBusy(true)
+          try {
+            const r = await api('cf-proxy-prefix-set', { proxyPrefix: proxyDraft })
+            if (r.error) flash('保存失败：' + r.error, 'err')
+            else {
+              flash(r.proxyPrefix ? ('代理前缀已保存：' + r.proxyPrefix) : '已关闭 URL 改写')
+              setProxyEditing(false); setProxyDraft('')
+              await load()
+            }
+          } catch (e) { flash('保存失败：' + String(e && e.message || e), 'err') }
+          setBusy(false)
+        }
+        const clearProxyPrefix = async () => {
+          setBusy(true)
+          try {
+            const r = await api('cf-proxy-prefix-set', { proxyPrefix: '' })
+            if (r.error) flash('清除失败：' + r.error, 'err')
+            else { flash('已关闭 URL 改写，列表只显示原始直连地址'); setProxyEditing(false); setProxyDraft(''); await load() }
+          } catch (e) { flash('清除失败：' + String(e && e.message || e), 'err') }
+          setBusy(false)
         }
 
         const addNamed = async () => {
@@ -1433,19 +1473,41 @@ window.__ModuleLoader__.load({
                 React.createElement('div', { className: 'dshcf-tip', style: { marginTop: 4 } }, '无需 Cloudflare 账号；输入本地端口即可获得临时公网地址（面板会同时给出墙内可用的代理地址）'),
               )
             : maps.map((qt) => {
-                const proxy = toProxyUrl(qt.url)
+                // 代理前缀来自 cf-status（用户可在「设置」里配）；留空表示不启用改写。
+                const prefix = (status && typeof status.proxyPrefix === 'string') ? status.proxyPrefix : ''
+                const proxy = toProxyUrl(qt.url, prefix)
+                // 三种状态要分清楚，别混成一句话：
+                //   1) 拿到 URL 且配了代理   → 主行显示代理地址，副行显示原始直连
+                //   2) 拿到 URL 但没配代理   → 主行显示原始直连，并提示可去设置里配
+                //   3) 还没拿到 URL          → 显示「等待分配域名…」，禁用复制
+                // 修复前：只要没配代理就一律显示「等待 URL…」，哪怕 URL 早就有了，
+                // 用户看到的就是「有地址却说等待」。
+                const mainNode = proxy
+                  ? React.createElement('a', { className: 'dshcf-url', href: proxy, target: '_blank', rel: 'noopener', title: '经代理前缀访问（直连不可达时用这个）' }, proxy)
+                  : qt.url
+                    ? React.createElement('a', { className: 'dshcf-url', href: qt.url, target: '_blank', rel: 'noopener', title: '直连地址' }, qt.url)
+                    : React.createElement('span', { className: 'dshcf-tip' }, '等待分配域名…')
                 return React.createElement('div', { key: qt.port, className: 'dshcf-map dshcf-map2' },
                   React.createElement('div', { className: 'dshcf-map-line' },
                     React.createElement('span', { className: 'dshcf-port' }, ':' + qt.port),
-                    proxy
-                      ? React.createElement('a', { className: 'dshcf-url', href: proxy, target: '_blank', rel: 'noopener', title: '经代理前缀访问（直连不可达时用这个）' }, proxy)
-                      : React.createElement('span', { className: 'dshcf-tip' }, '等待 URL…'),
-                    React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm', onClick: () => copyText(proxy), disabled: busy || !proxy, title: '复制代理地址' }, '复制'),
+                    mainNode,
+                    React.createElement('button', {
+                      className: 'dshcf-btn dshcf-btn-sm',
+                      onClick: () => copyText(proxy || qt.url || ''),
+                      disabled: busy || !(proxy || qt.url),
+                      title: proxy ? '复制代理地址' : '复制直连地址',
+                    }, '复制'),
                     React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm dshcf-btn-danger', onClick: () => stopQuick(qt.port), disabled: busy }, '停止'),
                   ),
-                  qt.url ? React.createElement('div', { className: 'dshcf-map-sub' },
+                  // 副行：只有「配了代理」时才需要额外展示原始地址；
+                  // 没配代理时主行就是原始地址，不用重复一遍。
+                  proxy && qt.url ? React.createElement('div', { className: 'dshcf-map-sub' },
+                    React.createElement('span', null, '原始直连：'),
                     React.createElement('a', { className: 'dshcf-url', href: qt.url, target: '_blank', rel: 'noopener' }, qt.url),
-                    React.createElement('span', null, '（原始直连地址，常被墙）'),
+                  ) : null,
+                  // 有 URL 但没配代理：提示可去设置里配（否则用户不知道有这个功能）。
+                  (!prefix && qt.url) ? React.createElement('div', { className: 'dshcf-map-sub' },
+                    React.createElement('span', { className: 'dshcf-tip' }, '直连 trycloudflare.com 在部分网络下不可达。可在「设置」页签配置「URL 改写代理前缀」，改走自己的域名。'),
                   ) : null,
                 )
               }),
@@ -1454,7 +1516,49 @@ window.__ModuleLoader__.load({
               React.createElement('input', { className: 'dshcf-w3', placeholder: '本地端口，如 8899', value: newPort, onChange: (e) => setNewPort(e.target.value) }),
               React.createElement('button', { className: 'dshcf-btn dshcf-btn-primary', onClick: addQuick, disabled: busy }, busy ? '处理中…' : '⚡ 启动临时隧道'),
             ),
-            React.createElement('div', { className: 'dshcf-tip' }, '临时公网预览：进程随 DSH 关闭而结束，域名每次启动都会变化。若直连 trycloudflare.com 不可达，可在面板里配置「URL 改写代理前缀」，列表会额外给出代理地址；页面内写死 trycloudflare 域名的绝对链接不会走代理。长期使用请用上方的 Named 隧道。'),
+            React.createElement('div', { className: 'dshcf-tip' }, '临时公网预览：进程独立于 DSH 运行，DSH 退出后隧道仍会保持可访问，不用时请手动点「停止」；域名每次启动都会变化。长期使用请用上方的 Named 隧道。'),
+          ),
+
+          // ── URL 改写代理前缀（可选）──
+          // 直连 trycloudflare.com 在部分网络下不可达时，把目标域名拼到自己
+          // 的域名后面借正常边缘节点访问。留空 = 不启用，面板只显示原始地址。
+          React.createElement('div', { className: 'dshcf-formcard' },
+            React.createElement('div', { className: 'dshcf-formcard-title' },
+              'URL 改写代理前缀',
+              React.createElement('span', { className: 'dshcf-tip', style: { marginLeft: 8, fontWeight: 400 } },
+                (status && status.proxyPrefix) ? '已启用' : '未配置'),
+            ),
+            proxyEditing
+              ? React.createElement(React.Fragment, null,
+                  React.createElement('div', { className: 'dshcf-add' },
+                    React.createElement('input', {
+                      className: 'dshcf-w3',
+                      style: { flex: '1 1 240px' },
+                      placeholder: '如 https://your-proxy.example.com/https/',
+                      value: proxyDraft,
+                      onChange: (e) => setProxyDraft(e.target.value),
+                    }),
+                    React.createElement('button', { className: 'dshcf-btn dshcf-btn-primary', onClick: saveProxyPrefix, disabled: busy }, '保存'),
+                    React.createElement('button', { className: 'dshcf-btn', onClick: () => { setProxyEditing(false); setProxyDraft('') } }, '取消'),
+                  ),
+                  React.createElement('div', { className: 'dshcf-tip' },
+                    '格式：<你的代理前缀><目标域名>。例如前缀填 https://p.example.com/https/ 时，',
+                    'https://xxx.trycloudflare.com 会显示为 https://p.example.com/https/xxx.trycloudflare.com 。',
+                    '必须以 http:// 或 https:// 开头；留空表示不启用改写。',
+                  ),
+                )
+              : React.createElement('div', { className: 'dshcf-add' },
+                  React.createElement('div', { style: { flex: '1 1 240px', fontSize: 12, color: 'var(--dsw-alias-label-secondary)', wordBreak: 'break-all' } },
+                    (status && status.proxyPrefix) || '未配置（只显示原始直连地址）'),
+                  React.createElement('button', {
+                    className: 'dshcf-btn dshcf-btn-sm',
+                    onClick: () => { setProxyEditing(true); setProxyDraft((status && status.proxyPrefix) || '') },
+                  }, '配置'),
+                  (status && status.proxyPrefix)
+                    ? React.createElement('button', { className: 'dshcf-btn dshcf-btn-sm dshcf-btn-danger', onClick: clearProxyPrefix, disabled: busy }, '清除')
+                    : null,
+                ),
+            React.createElement('div', { className: 'dshcf-tip' }, '注意：只改写面板里展示的链接。页面内部写死了 trycloudflare 域名的绝对链接（比如自己页面里的资源地址）不会走代理。'),
           ),
         )
 
