@@ -17,7 +17,7 @@ import fs from 'node:fs'
 
 export const inject = ['shell', 'webServer']
 
-const PLUGIN_VERSION = '1.7.0'
+const PLUGIN_VERSION = '1.8.0'
 // ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
 //
 // 解析顺序：
@@ -452,9 +452,19 @@ export function apply(ctx) {
       const pidFile = PIDS_DIR + '/dsh-cf-named.pid'
       const alive = await sh(`if [ -s ${pidFile} ]; then kill -0 "$(cat ${pidFile})" 2>/dev/null && echo yes || echo no; else echo no; fi`, 3000)
       if (!(alive.output || '').includes('yes')) {
-        spawnManaged('named', 'named',
-          `exec ${CLOUDFLARED_BIN} tunnel --config ${CONFIG_YML} run`,
-          LOGS_DIR + '/dsh-cf-named.log')
+        // ⚠ 不再直接 spawnManaged：那条路径不检查 config.yml / credentials.json，
+        //   文件缺失时 cloudflared 秒退，只在日志里留一行 ENOENT，表面上像
+        //   "自动启动没生效"。改走 restartNamedTunnel()，它负责
+        //   （a）确保二进制就位（b）校验凭据（c）按当前 ingress 重写 config.yml
+        //   （d）校验进程真的活着，失败时给出可读原因。
+        try {
+          const r = await restartNamedTunnel()
+          if (r && r.error) {
+            console.error('dsh-cloudflared-manager: Named 隧道自动启动失败:', r.error)
+          }
+        } catch (e) {
+          console.error('dsh-cloudflared-manager: Named 隧道自动启动异常:', e && e.message ? e.message : String(e))
+        }
       }
     }
     // 2) 本地服务
@@ -781,6 +791,41 @@ export function apply(ctx) {
     //   「还没装好，稍等」。
     const inst = await ensureCloudflared()
     if (!inst.ok) return { error: 'cloudflared 尚未就绪：' + (inst.error || '自动安装未完成，请稍后重试') }
+
+    // ⚠ 启动前必须确认两个文件都在，否则 cloudflared 会立刻退出，
+    //   而面板只会显示「未运行」，看不到任何原因。
+    //
+    //   历史 bug（2026-10-28 实测）：运行目录里 config.yml 与 credentials.json
+    //   都可能不存在（新装、或从备份恢复时只拷了 cf_config.json），而本函数
+    //   原先直接 exec 二进制。表现是：点「启动」→ 提示「已启动（连接 0）」→
+    //   状态始终「未运行」。日志里只有一行
+    //     open .../config.yml: no such file or directory
+    //   很容易被误判成"隧道启动不起来"。
+    //   现在：config.yml 由 buildYaml 按当前 ingress 现生成（内容来自云端或
+    //   本地，缺就写一份含 catch-all 的最小配置）；credentials.json 缺失时
+    //   明确报错并说明怎么补，而不是让进程静默退出。
+    const cfg0 = await readCfConfig()
+    if (!TUNNEL_ID()) {
+      return { error: '尚未配置隧道 ID（tunnelId）：请先在设置里填写，否则无法生成 config.yml' }
+    }
+    const chkCred = await sh(`test -s ${CREDENTIALS_JSON} && echo yes || echo no`, 5000)
+    if (!(chkCred.output || '').includes('yes')) {
+      return {
+        error: '缺少隧道凭据文件 credentials.json：cloudflared 无法认证。'
+          + '请用该隧道的 token 重新授权（cloudflared tunnel run --token <TOKEN>），'
+          + '或从备份恢复 credentials.json 后重试。'
+          + '（该文件包含 AccountTag / TunnelID / TunnelSecret，不会由插件自动生成）',
+      }
+    }
+    // 按当前 ingress 重写 config.yml（幂等）。ingress 来源：云端优先，失败回退本地。
+    // 这样即使文件不存在，也会被正确创建出来，而不是等 cloudflared 报错。
+    const cur = await readIngress({ force: true })
+    const entries = (cur && cur.length) ? cur : [{ hostname: null, service: 'http_status:404' }]
+    const yamlBody = buildYaml(entries)
+    const b64 = Buffer.from(yamlBody, 'utf8').toString('base64')
+    const wrote = await sh(`mkdir -p ${CF_SETUP} && echo '${b64}' | base64 -d > ${CONFIG_YML}`, 5000)
+    if (!wrote.ok) return { error: '写入 config.yml 失败：' + (wrote.output || '').slice(-200) }
+
     await killByPidFile(PIDS_DIR + '/dsh-cf-named.pid')
     await killByCmd(CLOUDFLARED_BIN + ' tunnel --config')
     await new Promise((resolve) => setTimeout(resolve, 1200))
@@ -790,13 +835,37 @@ export function apply(ctx) {
       10000,
     )
     if (!start.ok) return { error: '隧道启动失败: ' + (start.output || '') }
+
+    // 等连接建立，同时**确认进程真的活着**。
+    //
+    // ⚠ 历史 bug（2026-10-28 修复）：原先只等 connections > 0 就返回，
+    //   等不到也照样 return { ok:true, connections:0 }。当 cloudflared 因为
+    //   config.yml 缺失等原因秒退时，面板显示的是「Named 隧道已启动（连接 0）」
+    //   —— 启动了、但状态永远「未运行」，两条信息自相矛盾。
+    //   现在：每轮都探 PID 是否存活；进程已退出就立刻返回失败，并把日志尾部
+    //   带出来，让「为什么起不来」一眼可见，而不用去翻日志文件。
+    const pidFile = PIDS_DIR + '/dsh-cf-named.pid'
     let conns = 0
+    let alive = false
     for (let i = 0; i < 12; i++) {
       await new Promise((resolve) => setTimeout(resolve, 1000))
+      const chk = await sh(`if [ -s ${pidFile} ]; then kill -0 "$(cat ${pidFile})" 2>/dev/null && echo yes || echo no; else echo no; fi`, 3000)
+      alive = (chk.output || '').includes('yes')
       conns = await namedConnections()
       if (conns > 0) break
+      // 进程已死且没连上，继续等没有意义（多半是配置/凭据问题）
+      if (!alive && i >= 2) break
     }
-    return { ok: true, connections: conns }
+    if (!alive && conns === 0) {
+      const tail = await sh(`tail -5 ${LOGS_DIR}/dsh-cf-named.log 2>/dev/null || true`, 5000)
+      const msg = String(tail.output || '').trim()
+      return {
+        error: 'cloudflared 启动后立即退出，隧道未运行'
+          + (msg ? '。日志尾部：' + msg.slice(-400) : '（无日志输出）'),
+        launched: false,
+      }
+    }
+    return { ok: true, connections: conns, alive }
   }
 
   async function stopNamedTunnel() {
