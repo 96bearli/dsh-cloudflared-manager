@@ -18,9 +18,39 @@ import fs from 'node:fs'
 export const inject = ['shell', 'webServer']
 
 const PLUGIN_VERSION = '1.1.0'
-// 运行目录。默认放在 DSH_HOME 下，可用环境变量覆盖（容器/多实例部署时改这里）。
-const CF_SETUP = process.env.DSH_CF_SETUP
-  || ((process.env.DSH_HOME || '/data/dsh') + '/cloudflared-setup')
+// ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
+//
+// 解析顺序：
+//   1. 环境变量 DSH_CF_SETUP（显式指定，优先级最高）
+//   2. $DSH_HOME/cloudflared-setup（默认，新装用户走这条）
+//   3. 若干历史路径（老版本把目录放在别处，升级后不能因为路径变了就"丢失"配置）
+//
+// ⚠ 为什么要有第 3 步：本插件早期版本把运行目录硬编码在代码里（如
+//   /data/dsh/home/test/cloudflared-setup）。如果升级后只认新默认值，
+//   老用户的所有配置（隧道凭证、服务定义、API Token）会突然"消失"——
+//   表现为面板全空、服务列表 0 条。这里按顺序探测，命中第一个**确实存在
+//   cf_config.json 或 services.json** 的目录，避免这种静默故障。
+function resolveCfSetup() {
+  if (process.env.DSH_CF_SETUP) return process.env.DSH_CF_SETUP
+  const home = process.env.DSH_HOME || '/data/dsh'
+  const candidates = [
+    home + '/cloudflared-setup',
+    // 历史路径（存在旧配置时继续沿用）
+    home + '/home/test/cloudflared-setup',
+    '/data/dsh/home/test/cloudflared-setup',
+  ]
+  const looksLikeSetup = (dir) => {
+    try {
+      return fs.existsSync(dir + '/cf_config.json') || fs.existsSync(dir + '/services.json')
+    } catch (e) { return false }
+  }
+  for (const dir of candidates) {
+    if (looksLikeSetup(dir)) return dir
+  }
+  // 都没配置：返回默认值，由 ensureCloudflared 等逻辑按需创建
+  return candidates[0]
+}
+const CF_SETUP = resolveCfSetup()
 const CLOUDFLARED_BIN = CF_SETUP + '/node_modules/@farthershore/cloudflared-linux-x64/bin/cloudflared'
 const CONFIG_YML = CF_SETUP + '/config.yml'
 const CREDENTIALS_JSON = CF_SETUP + '/credentials.json'
