@@ -777,10 +777,24 @@ window.__ModuleLoader__.load({
           try {
             const d = await api('cf-status')
             setStatus(d)
-            if (d && d.managed) {
-              const namedManaged = d.managed.find(m => m.name === 'named')
-              setAutoStartNamed(namedManaged ? namedManaged.alive : false)
-            }
+            // ── 自动启动勾选状态：以 cf-status.autoStart 为准 ──
+            //
+            // ⚠ 历史 bug（2026-10-28 修复）：这里原本去 d.managed 里找
+            //   name === 'named' 的条目，再用它的 alive 回填勾选框。但
+            //   managed 只记录 spawnManaged 起的进程，里面**只有 svc:* 条目**
+            //   （Named 隧道是 nohup + PID 文件启动的，从不进 managedProcs）。
+            //   于是 find() 永远返回 undefined → 每次 load 都把勾选框
+            //   setAutoStartNamed(false)。
+            //
+            //   更糟的是它和 loadAutoStart() 抢着写同一个 state：
+            //   打开面板时两者并发，loadAutoStart 先读到正确的 true，
+            //   load() 随后把它覆盖成 false；之后每 30 秒自动刷新再来一次。
+            //   表现就是「点了自动启动、确认了、也提示成功了，勾选框却始终不勾」
+            //   ——而 cf_config.json 里其实早就写好了 autoStart: true。
+            //
+            //   现在直接读 host 端在 cf-status 里返回的 autoStart 真值
+            //   （它来自 cf_config.json），不再拿"进程是否活着"当开关状态。
+            if (d && typeof d.autoStart === 'boolean') setAutoStartNamed(d.autoStart)
           } catch (e) { setError(String(e && e.message || e)) }
           setLoading(false)
         }, [])

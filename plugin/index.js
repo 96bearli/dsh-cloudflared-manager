@@ -17,7 +17,7 @@ import fs from 'node:fs'
 
 export const inject = ['shell', 'webServer']
 
-const PLUGIN_VERSION = '1.10.0'
+const PLUGIN_VERSION = '1.10.1'
 // ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
 //
 // 解析顺序：
@@ -1260,6 +1260,11 @@ export function apply(ctx) {
             quickTunnels: maps,
             binPath: CLOUDFLARED_BIN,
             cfApi: { tokenSet: !!(cfg.apiToken) },
+            // Named 隧道「随 DSH 自动启动」开关的真值（落盘在 cf_config.json）。
+            // 面板用它回填勾选框。⚠ 不要用 managed[] 里的进程存活状态代替：
+            // managed 只跟踪 spawnManaged 起的进程，Named 隧道走的是 nohup +
+            // PID 文件，压根不在里面，用它会恒判为 false。
+            autoStart: !!cfg.autoStart,
             // 凭据自检：新装环境下 credentials.json 是不存在的。
             // 这里只做「文件在不在 + 隧道 ID 对不对」的读校验，不触发网络请求，
             // 面板可据此提示「首次启动会自动生成」，而不是让用户去猜为什么起不来。
