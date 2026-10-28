@@ -34,6 +34,17 @@
 
 ## 安装
 
+### 从 npm 安装（推荐）
+
+```bash
+dsh plugin --profile web add dsh-cloudflared-manager
+```
+
+装完重启 DSH 即可。这条路径依赖包内的 `cordis.patch.yml` 和 `package.json` 的
+`dsh.bundle.patch` 字段——两者都随发布产物一起分发，不需要手工改 profile。
+
+> 若 `dsh plugin` 报 `declares no dsh.bundle`，说明装到的版本低于 1.2.0，升级后再试。
+
 ### 从 GitHub 安装
 
 ```bash
@@ -44,7 +55,7 @@ dsh plugin --profile web add github:96bearli/dsh-cloudflared-manager
 
 ```bash
 git clone https://github.com/96bearli/dsh-cloudflared-manager.git
-dsh plugin --profile web add /path/to/dsh-cloudflared-manager
+dsh plugin --profile web add /path/to/dsh-plugin-cloudflared-manager
 ```
 
 安装后重启 DSH，会话头部会出现「🌐 隧道」按钮，面板停靠在右侧边栏。

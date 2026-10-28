@@ -1,6 +1,6 @@
 {
   "name": "dsh-cloudflared-manager",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Cloudflare Tunnel + 本地服务管理器（DSH 插件）：Named 隧道增删改查、本地服务启停与日志、源码在线编辑、快速隧道临时公网，DNS 自动同步",
   "type": "module",
   "main": "./plugin/index.js",
@@ -13,6 +13,7 @@
     "plugin/index.js",
     "plugin/client.js",
     "plugin/package.json",
+    "cordis.patch.yml",
     "runtime-examples",
     "README.md",
     "LICENSE"
@@ -20,7 +21,9 @@
   "keywords": [
     "dsh",
     "dsh-plugin",
+    "deepseek",
     "deepseek-harness",
+    "harness",
     "cloudflare",
     "cloudflared",
     "tunnel",
@@ -43,12 +46,15 @@
     "node": ">=18"
   },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web"
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh": ">=0.2.0"
+    "@deepseek-ai/dsh": ">=0.1.0 <1.0.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh": {

@@ -1,0 +1,12 @@
+# dsh-cloudflared-manager bundle 层——当 profile 的 dsh.profile.bundles 列出本包时生效
+# （通过 package.json 的 dsh.bundle.patch 指向本文件）。
+#
+# ⚠️ name 是**包名**（经 profile 的 node_modules 或安装回退目录解析），不是相对路径。
+#    包名解析到本包 main 入口：./plugin/index.js（host 半区）。
+#
+# 只插一条。不要在这里再写第二条同 id 条目，也不要同时把本包 vendor 进
+# profiles/web/plugins/ 又让 bundles 指向它——那样会二次挂载、重复注册
+# /dsh-cf/api 路由，apply() 抛错后 fail-loud 会让 DSH 起不来。
+- insert:
+    - id: dsh-cloudflared-manager
+      name: dsh-cloudflared-manager
