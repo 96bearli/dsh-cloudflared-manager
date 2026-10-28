@@ -17,7 +17,7 @@ import fs from 'node:fs'
 
 export const inject = ['shell', 'webServer']
 
-const PLUGIN_VERSION = '1.9.0'
+const PLUGIN_VERSION = '1.10.0'
 // ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
 //
 // 解析顺序：
@@ -91,6 +91,7 @@ const CF_DEFAULTS = {
   tunnelId: '',
   accountId: '',
   zoneWhitelist: [],     // 例：['example.com', 'example.net']
+  protocol: '',          // '' = 交给 cloudflared 决定；可选 'http2' / 'quic'
 }
 
 
@@ -437,6 +438,9 @@ export function apply(ctx) {
       tunnelId: typeof cfg.tunnelId === 'string' ? cfg.tunnelId.trim() : '',
       accountId: typeof cfg.accountId === 'string' ? cfg.accountId.trim() : '',
       zoneWhitelist: list.map((z) => String(z).trim().toLowerCase()).filter(Boolean),
+      // 隧道传输协议：'' (交给 cloudflared 决定) | 'http2' | 'quic'。
+      // 只接受这两个已知值，避免把用户填错的串写进 config.yml 让 cloudflared 起不来。
+      protocol: (cfg.protocol === 'http2' || cfg.protocol === 'quic') ? cfg.protocol : '',
     }
     return cfMeta
   }
@@ -714,12 +718,51 @@ export function apply(ctx) {
     return entries
   }
 
+  // ── ingress service 里 localhost → 127.0.0.1 ──
+  //
+  // ⚠ 为什么必须改写（2026-10-28 实测）：本机 /etc/hosts 同时有
+  //     127.0.0.1 localhost
+  //     ::1       localhost ip6-localhost ip6-loopback
+  //   于是 cloudflared 解析 localhost 会拿到**两个**地址，且优先用 ::1。
+  //   而这里的本地服务几乎全部只监听 IPv4（3082 绑的是 127.0.0.1，
+  //   8766/8444 绑的是 0.0.0.0），IPv6 回环上没有任何监听 →
+  //   cloudflared 连 [::1]:PORT 被拒，公网表现为 502（或直接超时 000）：
+  //     Unable to reach the origin service ... dial tcp [::1]:3082: connect: connection refused
+  //   日志里明明写着 "Registered tunnel connection"、连接数也正常，
+  //   所以很容易误判成"隧道没问题、是站点自己挂了"。
+  //
+  //   写死 127.0.0.1 就避开了这个歧义：它明确指向 IPv4 回环，与服务实际
+  //   监听地址一致。对确实监听 IPv6 的服务，用户仍可在映射里手填 [::1]。
+  function normalizeLocalhost(service) {
+    return String(service || '').replace(
+      /^(https?:\/\/)localhost(?=[:/]|$)/i,
+      '$1127.0.0.1',
+    )
+  }
+
   function buildYaml(entries) {
     const withHost = entries.filter((e) => e.hostname)
     const catchAll = entries.find((e) => !e.hostname) || { hostname: null, service: 'http_status:404' }
-    let y = `tunnel: ${TUNNEL_ID()}\ncredentials-file: ${CREDENTIALS_JSON}\ningress:\n`
-    for (const e of withHost) y += `  - hostname: ${e.hostname}\n    service: ${e.service}\n`
-    y += `  - service: ${catchAll.service}\n`
+    let y = `tunnel: ${TUNNEL_ID()}\ncredentials-file: ${CREDENTIALS_JSON}\n`
+    // ── 传输协议（可选）──
+    //
+    // ⚠ 为什么必须支持这个字段：本函数每次启动 Named 隧道都会**整份重写**
+    //   config.yml。旧版只写 tunnel/credentials-file/ingress 三项，于是用户
+    //   手工加的 `protocol: http2` 会在下一次「启动」时被静默抹掉，隧道悄悄
+    //   退回默认的 QUIC。
+    //
+    //   这在 UDP 接收缓冲区偏小的机器上是真问题：实测某台机器
+    //   rmem 上限只有 416 KiB（期望 7168 KiB），QUIC 因此频繁丢包，
+    //   4 条连接里常有一条反复重连，公网请求耗时在 2s–15s 之间剧烈抖动、
+    //   约 40% 直接超时。HTTP/2 走 TCP，不受该限制。
+    //
+    //   所以这里从 cf_config.json 读 protocol 并原样写回（不设默认值：
+    //   留空表示交给 cloudflared 自己决定，保持原有行为）。
+    const proto = (cfMeta.protocol || '').trim()
+    if (proto) y += `protocol: ${proto}\n`
+    y += 'ingress:\n'
+    for (const e of withHost) y += `  - hostname: ${e.hostname}\n    service: ${normalizeLocalhost(e.service)}\n`
+    y += `  - service: ${normalizeLocalhost(catchAll.service)}\n`
     return y
   }
 
@@ -1238,9 +1281,6 @@ export function apply(ctx) {
             zoneWhitelist: ZONE_WHITELIST(),
             managed: Array.from(managedProcs.entries()).map(([name, st]) => ({ name, type: st.type, alive: !st.proc.killed })),
           }
-        } else if (method === 'cf-cfg-get') {
-          const cfg = await readCfConfig()
-          return { apiToken: cfg.apiToken || '', tokenSet: !!(cfg.apiToken), autoStart: !!cfg.autoStart }
         } else if (method === 'cf-whitelist-add') {
           // 单独增删根域名白名单：**不要求已配 API Token**，
           // 因为白名单本身是本地安全边界，与 token 无关。
@@ -1294,22 +1334,38 @@ export function apply(ctx) {
           if (Array.isArray(args.zoneWhitelist)) {
             cfg.zoneWhitelist = args.zoneWhitelist.map((z) => String(z).trim().toLowerCase()).filter(Boolean)
           }
+          // 隧道传输协议：'http2' / 'quic' / ''（清空＝交给 cloudflared 决定）。
+          // 其他值一律拒绝——config.yml 里的 protocol 写错 cloudflared 会直接起不来。
+          if (typeof args.protocol === 'string') {
+            const p = args.protocol.trim().toLowerCase()
+            if (p && p !== 'http2' && p !== 'quic') {
+              return { error: `不支持的协议：${args.protocol}（可选 http2 / quic / 留空）` }
+            }
+            cfg.protocol = p
+          }
           await writeCfConfig(cfg)
           await refreshCfMeta()
           zoneIdCache.clear()   // zone 可能变了，清掉解析缓存
           return {
             ok: true, apiToken: '***',
             tunnelId: cfMeta.tunnelId, accountId: cfMeta.accountId, zoneWhitelist: cfMeta.zoneWhitelist,
+            protocol: cfMeta.protocol,
           }
         } else if (method === 'cf-cfg-get') {
           // 把账号级配置一并返回，便于用户对照/迁移（token 只回是否已设置）
           const cfg = await readCfConfig()
           return {
             ok: true,
+            // ⚠ 不要回明文 token；只回「是否已配置」。
             tokenSet: !!cfg.apiToken,
+            // 兼容字段：早期前端只读这两个，保留以免老版本面板拿不到值。
+            apiToken: cfg.apiToken || '',
+            autoStart: !!cfg.autoStart,
             tunnelId: cfMeta.tunnelId,
             accountId: cfMeta.accountId,
             zoneWhitelist: cfMeta.zoneWhitelist,
+            // 隧道传输协议：'' 表示未指定（cloudflared 默认 QUIC）
+            protocol: cfMeta.protocol,
             // 快速隧道的「URL 改写代理前缀」：留空表示不启用改写，只给原始直连地址。
             proxyPrefix: typeof cfg.proxyPrefix === 'string' ? cfg.proxyPrefix : '',
           }

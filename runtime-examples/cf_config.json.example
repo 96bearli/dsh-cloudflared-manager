@@ -16,6 +16,18 @@
 #                  example.com）。解析不出 apex 的域名一律拒绝，不做猜测。
 #                  例如 ["example.com", "example.net"]
 #   autoStart      DSH 启动时是否自动拉起 Named 隧道（true/false）。
+#   protocol       隧道传输协议：可选 "http2" / "quic"，留空＝交给 cloudflared
+#                  决定（默认 QUIC）。如果本机 UDP 接收缓冲区偏小
+#                  （sysctl net.core.rmem_max 远小于 7168 KiB），QUIC 会频繁丢包，
+#                  表现为公网请求耗时在数秒到十几秒剧烈抖动、大量超时，此时
+#                  应设为 "http2"（走 TCP，不受该限制）。
+#
+# 关于 ingress 里的 localhost：
+#   插件写 config.yml 时会把 service 里的 http://localhost:PORT 改写成
+#   http://127.0.0.1:PORT。原因：/etc/hosts 里 localhost 同时指向 127.0.0.1 和
+#   ::1，cloudflared 会优先用 ::1，而本地服务大多只监听 IPv4，于是连 [::1] 被拒、
+#   公网表现为 502（日志里是 "dial tcp [::1]:PORT: connect: connection refused"）。
+#   确实要连 IPv6 服务时，可在映射里直接手填 http://[::1]:PORT（不会被改写）。
 #
 # 关于 zoneId（已废弃）：
 #   早期版本有 zoneId 字段，用作「域名解析不出 zone 时」的兜底放行。
@@ -28,5 +40,6 @@
   "tunnelId": "YOUR_TUNNEL_UUID",
   "accountId": "YOUR_ACCOUNT_ID",
   "zoneWhitelist": ["example.com"],
-  "autoStart": false
+  "autoStart": false,
+  "protocol": ""
 }

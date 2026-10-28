@@ -179,6 +179,44 @@ Account → Cloudflare Tunnel → **Read**），把返回的隧道 token 解出�
 面板会明确报出这类情况（而不是笼统显示"成功"）。看到提示后请到 Cloudflare
 DNS 面板核对并手动清理，否则残留记录会一直指向已失效的映射。
 
+### 传输协议（QUIC / HTTP2）
+
+`cloudflared` 默认走 QUIC（UDP）。若本机 UDP 接收缓冲区偏小，QUIC 会频繁丢包：
+连接数看着正常、日志里也有 `Registered tunnel connection`，但公网请求耗时在
+2–15 秒之间剧烈抖动、大量直接超时，非常容易被误判成"目标站点慢"。
+
+先看内核上限：
+
+```bash
+sysctl net.core.rmem_max        # 理想 7168 KiB
+```
+
+若远小于该值，在 `cf_config.json` 里加一行改用 TCP：
+
+```json
+{ "protocol": "http2" }
+```
+
+插件每次启动都会重写 `config.yml`，会把这个字段原样写回（旧版本会把它丢掉，
+导致手工加的设置在下一次「启动」后静默失效）。
+
+### 关于 ingress 里的 localhost
+
+插件写 `config.yml` 时会把 `service` 里的 `http://localhost:PORT` 自动改写成
+`http://127.0.0.1:PORT`。
+
+原因：多数 Linux 的 `/etc/hosts` 里 `localhost` 同时指向 `127.0.0.1` 和 `::1`，
+cloudflared 解析后会**优先用 `::1`**；而本地服务通常只监听 IPv4，于是连
+`[::1]:PORT` 被拒，公网表现为 **502**。这一条很难查，因为隧道状态一切"健康"，
+日志里才有一行：
+
+```
+Unable to reach the origin service ... dial tcp [::1]:3082: connect: connection refused
+```
+
+确实要连 IPv6 服务时，可在映射的 service 里直接手填 `http://[::1]:PORT`——
+这种显式写法不会被改写。
+
 ---
 
 ## 使用
