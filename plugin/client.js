@@ -1798,25 +1798,29 @@ window.__ModuleLoader__.load({
         // 避免前后端两套规则不一致。
         const addApex = async () => {
           const v = apexInput.trim()
-          if (!v) { setNotice('请输入根域名'); return }
+          if (!v) { flash('请输入根域名', 'err'); return }
           setBusy(true); setNotice('')
           try {
             const r = await api('cf-whitelist-add', { apex: v })
-            if (r.error) setNotice('添加失败：' + r.error)
+            if (r.error) flash('添加失败：' + r.error, 'err')
             else {
               flash(r.already ? ('已在白名单中：' + r.apex) : ('已添加：' + r.apex))
               setApexInput('')
               await load()
-              // 加完顺手验一下能不能写 DNS，有问题当场就能看到
+              // 加完顺手验一下能不能写 DNS，有问题当场就能看到，
+              // 免得等到建映射时才发现这个域名根本用不了。
               try {
                 const t = await api('cf-cfg-test', {})
                 const m = {}
                 for (const z of (t.zones || [])) m[z.apex] = !!z.ok
                 setZoneStatus(m)
-                if (t.zones && t.zones.length && !t.ok) flash('已添加，但该域名暂不可用：' + (t.message || ''))
+                const target = (t.zones || []).find((z) => z.apex === r.apex)
+                if (target && !target.ok) {
+                  flash('已添加 ' + r.apex + '，但该域名暂不可写 DNS（检查 Token 的 Zone:Read / DNS:Edit 权限，以及该域名是否在这个 Cloudflare 账号下）', 'err')
+                }
               } catch (e) { /* 校验失败不影响添加结果 */ }
             }
-          } catch (e) { setNotice('添加失败：' + String(e && e.message || e)) }
+          } catch (e) { flash('添加失败：' + String(e && e.message || e), 'err') }
           setBusy(false)
         }
 
@@ -1824,28 +1828,32 @@ window.__ModuleLoader__.load({
           setBusy(true); setNotice('')
           try {
             const r = await api('cf-whitelist-remove', { apex })
-            if (r.error) setNotice('移除失败：' + r.error)
+            if (r.error) flash('移除失败：' + r.error, 'err')
             else {
               flash(r.removed ? ('已移除：' + apex) : ('不在白名单中：' + apex))
               setZoneStatus((prev) => { const n = { ...prev }; delete n[apex]; return n })
               await load()
             }
-          } catch (e) { setNotice('移除失败：' + String(e && e.message || e)) }
+          } catch (e) { flash('移除失败：' + String(e && e.message || e), 'err') }
           setBusy(false)
         }
 
-        // 逐个探测白名单域名的可写性，结果标在每条右侧
+        // 逐个探测白名单域名的可写性，结果标在每条右侧。
+        // 注意判定顺序：cf-cfg-test 在未配 Token 时直接返回 { ok:false,
+        // error:'未配置 API Token' }，此时没有 zones 字段 —— 必须先判 token，
+        // 再判"白名单为空"，否则会误报成空白名单。
         const checkZones = async () => {
-          setBusy(true); setNotice('校验中…')
+          setBusy(true); setNotice('')
           try {
             const t = await api('cf-cfg-test', {})
+            if (t.error) { flash('校验失败：' + t.error, 'err'); return setBusy(false) }
             const m = {}
             for (const z of (t.zones || [])) m[z.apex] = !!z.ok
             setZoneStatus(m)
-            if (!t.tokenSet && !t.tokenValid) flash('尚未配置 API Token，无法校验域名可用性')
-            else if (!t.zones || t.zones.length === 0) flash('白名单为空，先添加根域名')
-            else flash(t.message || (t.ok ? '全部可用' : '部分域名不可用'))
-          } catch (e) { flash('校验失败：' + String(e && e.message || e)) }
+            if (!t.tokenValid) flash('Token 无效，无法校验域名 —— 请先在上面保存有效的 API Token', 'err')
+            else if (!t.zones || t.zones.length === 0) flash('白名单为空，先添加根域名', 'err')
+            else flash(t.message || (t.ok ? '全部域名可写 DNS' : '部分域名不可用'), t.ok ? 'ok' : 'err')
+          } catch (e) { flash('校验失败：' + String(e && e.message || e), 'err') }
           setBusy(false)
         }
 
@@ -1888,7 +1896,21 @@ window.__ModuleLoader__.load({
           // 单个 zoneId 只能对应一个 zone，拿它去建另一个首级域名的记录会把
           // hostname 当该 zone 的子域，正是「映射建歪」的成因。
           React.createElement('div', { className: 'dshcf-about' },
-            React.createElement('h3', { className: 'dshcf-sec-title' }, '🌐 根域名白名单'),
+            // 标题行：左侧标题，右侧「校验可用性」。
+            // 校验的是**整份白名单**（逐个域名探 DNS 写权限），不是输入框里正在
+            // 打的那个域名 —— 所以它该跟列表站在一起，而不是跟「添加」按钮并排。
+            // 原先放在「添加」旁边，容易被理解成"校验我刚输入的这个"。
+            React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+              React.createElement('h3', { className: 'dshcf-sec-title', style: { margin: 0, flex: '1 1 auto' } }, '🌐 根域名白名单'),
+              zoneWhitelist.length > 0
+                ? React.createElement('button', {
+                    className: 'dshcf-btn dshcf-btn-sm',
+                    onClick: checkZones,
+                    disabled: busy,
+                    title: '逐个检查白名单里的域名：能否解析到 zone、能否写 DNS',
+                  }, busy ? '校验中…' : '校验可用性')
+                : null,
+            ),
             zoneWhitelist.length === 0
               ? React.createElement('div', { className: 'dshcf-about-desc' },
                   '尚未配置。没有白名单时，Named 隧道映射无法自动同步 DNS —— 插件不知道把记录写到哪个 zone。')
@@ -1926,7 +1948,6 @@ window.__ModuleLoader__.load({
                 onKeyDown: (e) => { if (e.key === 'Enter') addApex() },
               }),
               React.createElement('button', { className: 'dshcf-btn dshcf-btn-primary', onClick: addApex, disabled: busy }, busy ? '处理中…' : '＋ 添加域名'),
-              React.createElement('button', { className: 'dshcf-btn', onClick: checkZones, disabled: busy }, '校验可用性'),
             ),
             React.createElement('div', { className: 'dshcf-tip', style: { marginTop: 8 } },
               '填根域名（example.com），不是子域名（别填 a.example.com）。',
