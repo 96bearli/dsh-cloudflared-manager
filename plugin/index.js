@@ -7,7 +7,7 @@
 //     cf-svc-start / cf-svc-stop / cf-svc-restart / cf-svc-log / cf-svc-auto-start-get|set
 //     cf-src-read / cf-src-save / cf-src-list                 （本地服务源码查看/编辑）
 //     cf-cfg-get / cf-cfg-set / cf-cfg-test                   （API Token 与账号级配置）
-//     cf-auto-start-now / cf-restart-dsh                      （生命周期）
+//     cf-restart-dsh                                          （生命周期）
 // Named 隧道以"本地 config.yml"模式运行（ingress 可本地增删改查），凭证由 token 生成。
 //
 // 本版本**不含 CF 优选 IP 扫描**（opt-* API 与 optimize.js）。

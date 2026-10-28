@@ -62,15 +62,26 @@ dsh plugin --profile web add /path/to/dsh-plugin-cloudflared-manager
 
 ### 手动部署（不用 dsh plugin 命令）
 
-```bash
-# 规范副本（客户端静态资源从这里提供）
-mkdir -p $DSH_HOME/profiles/web/plugins/dsh-cloudflared-manager
-cp plugin/* $DSH_HOME/profiles/web/plugins/dsh-cloudflared-manager/
+整包放在 profile 的 `node_modules` 下即可，**同一个目录同时承担两件事**：
+host 端 `require` 从这里加载（`package.json` 的 `main` 指向 `plugin/index.js`），
+client 端的 `client.js` 也由这里提供给浏览器。
 
-# 安装副本（host 端 require 实际加载这里）
-mkdir -p $DSH_HOME/profiles/node_modules/dsh-cloudflared-manager
-cp plugin/* $DSH_HOME/profiles/node_modules/dsh-cloudflared-manager/
+```bash
+DEST=$DSH_HOME/profiles/web/node_modules/dsh-cloudflared-manager
+mkdir -p "$DEST"
+cp -r package.json README.md LICENSE cordis.patch.yml plugin runtime-examples "$DEST"/
 ```
+
+> 不同 DSH 版本的 profile 布局可能不同。用这条命令确认本机该放哪：
+>
+> ```bash
+> dsh plugin --profile web add <本包路径>   # 装一次，看它落在哪
+> ls -d $DSH_HOME/profiles/*/node_modules/dsh-cloudflared-manager
+> ```
+>
+> 早期版本曾要求分别在 `profiles/web/plugins/`（client）和 `profiles/node_modules/`
+> （host）各放一份，现已不需要；两份并存反而容易版本不一致——症状是改了代码
+> 却不生效，或 API 报 `unknown method`。
 
 然后在 `$DSH_HOME/profiles/web/cordis.patch.yml` 的 `insert` 列表里加：
 
@@ -80,7 +91,8 @@ cp plugin/* $DSH_HOME/profiles/node_modules/dsh-cloudflared-manager/
       name: dsh-cloudflared-manager
 ```
 
-重启 DSH web 进程生效。
+重启 DSH web 进程生效。注意 **host 端（`plugin/index.js`）改动必须重启**，
+只改 `plugin/client.js` 的话刷新浏览器即可。
 
 ---
 
@@ -281,9 +293,14 @@ curl -s -X POST http://127.0.0.1:3080/dsh-cf/api \
 | Named 隧道 | `cf-named-list` `cf-named-add` `cf-named-update` `cf-named-delete` `cf-named-start` `cf-named-stop` `cf-named-auto-start-set` |
 | 本地服务 | `cf-svc-list` `cf-svc-add` `cf-svc-update` `cf-svc-note-set` `cf-svc-delete` `cf-svc-start` `cf-svc-stop` `cf-svc-restart` `cf-svc-log` `cf-svc-auto-start-get` `cf-svc-auto-start-set` |
 | 源码 | `cf-src-read` `cf-src-save` `cf-src-list` |
-| 配置 | `cf-cfg-get` `cf-cfg-set` `cf-cfg-test` |
-| 快速隧道 | `cf-maps` `cf-map-add` `cf-map-stop` |
-| 生命周期 | `cf-auto-start-now` `cf-restart-dsh` |
+| 配置 | `cf-cfg-get` `cf-cfg-set` `cf-cfg-test` `cf-cfg-auto-start-get` `cf-cfg-auto-start-set` |
+| 根域名白名单 | `cf-zones`（列出账号下可选 zone + 当前白名单）`cf-whitelist-add` `cf-whitelist-remove` |
+| 快速隧道 | `cf-maps` `cf-map-add` `cf-map-stop` `cf-proxy-prefix-get` `cf-proxy-prefix-set` |
+| 生命周期 | `cf-restart-dsh`（SIGHUP 重启 DSH） |
+
+`cf-whitelist-add/remove` 与 `cf-proxy-prefix-get/set` 读写的是本地配置，
+**不需要 API Token**；`cf-zones` 里"账号下可选 zone"那部分需要 Token 具备
+Zone:Read，没配 Token 时它只回白名单本身，前端会自动退回手输域名。
 
 ---
 
