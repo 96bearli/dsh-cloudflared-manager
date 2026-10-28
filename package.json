@@ -1,0 +1,58 @@
+{
+  "name": "dsh-cloudflared-manager",
+  "version": "1.1.0",
+  "description": "Cloudflare Tunnel + 本地服务管理器（DSH 插件）：Named 隧道增删改查、本地服务启停与日志、源码在线编辑、快速隧道临时公网，DNS 自动同步",
+  "type": "module",
+  "main": "./plugin/index.js",
+  "exports": {
+    ".": "./plugin/index.js",
+    "./client": "./plugin/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "plugin/index.js",
+    "plugin/client.js",
+    "plugin/package.json",
+    "runtime-examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cloudflare",
+    "cloudflared",
+    "tunnel",
+    "ngrok-alternative",
+    "local-services",
+    "process-manager",
+    "devtools"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/96bearli/dsh-cloudflared-manager.git"
+  },
+  "homepage": "https://github.com/96bearli/dsh-cloudflared-manager#readme",
+  "bugs": {
+    "url": "https://github.com/96bearli/dsh-cloudflared-manager/issues"
+  },
+  "license": "MIT",
+  "author": "96bearli",
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  }
+}

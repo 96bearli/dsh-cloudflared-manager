@@ -1,0 +1,25 @@
+# Cloudflare API 配置模板（cf_config.json）
+#
+# 用法：复制为 <DSH_HOME>/cloudflared-setup/cf_config.json 后填入真实值。
+# 该文件含密钥，权限应为 600，且**绝不可提交到 git**（已在 .gitignore 中）。
+#
+# 字段说明：
+#   apiToken       Cloudflare API Token。权限需含：
+#                    Zone → DNS:Edit（增删改映射时自动同步 CNAME）
+#                    Zone → Zone:Read（按 hostname 后缀自动解析 zoneId）
+#                    Account → Cloudflare Tunnel:Edit（读写云端 ingress 配置）
+#   zoneId         可选。默认由插件按 hostname 后缀 + zoneWhitelist 自动解析；
+#                  仅当 token 没有 Zone:Read 时才需要手动指定。
+#   tunnelId       你的 Named 隧道 ID（dash.cloudflare.com → Zero Trust → Tunnels 里可查）。
+#   accountId      你的 Cloudflare 账号 ID（控制台右侧栏 / URL 中可见）。
+#   zoneWhitelist  允许操作的根域名列表。安全边界：防止误把记录建到不相干的 zone。
+#                  例如 ["example.com", "example.net"]
+#   autoStart      DSH 启动时是否自动拉起 Named 隧道（true/false）。
+{
+  "apiToken": "YOUR_CLOUDFLARE_API_TOKEN",
+  "zoneId": null,
+  "tunnelId": "YOUR_TUNNEL_UUID",
+  "accountId": "YOUR_ACCOUNT_ID",
+  "zoneWhitelist": ["example.com"],
+  "autoStart": false
+}

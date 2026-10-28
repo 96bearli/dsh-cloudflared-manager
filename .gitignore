@@ -1,0 +1,32 @@
+# 依赖与产物
+node_modules/
+.pnpm-store/
+*.log
+*.pid
+
+# 运行时数据（绝不可提交）
+credentials.json
+cf_config.json
+services.json
+config.yml
+pids/
+opt-config.json
+opt-backups.json
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# 临时文件
+tmp/
+.tmp/
+*.bak
+*.bak.*
+
+# vendor 下的 cloudflared 二进制（38MB，各平台不同，插件会自动下载）
+vendor/**/bin/cloudflared
+vendor/**/*.exe

@@ -1,0 +1,10 @@
+# Named 隧道配置模板（config.yml）——脱敏
+# 说明：本插件对 "remotely-managed 隧道"（token 创建）实际以"云端配置"为准（见 README），
+#       此文件作为本地备份/降级；插件增删映射时会同步写本地 + 云端 PUT。
+# TUNNEL_ID 为你的隧道 UUID（Cloudflare 控制台 或 token 解出的 "t" 字段）。
+tunnel: YOUR_TUNNEL_ID
+credentials-file: /data/dsh/home/test/cloudflared-setup/credentials.json
+ingress:
+  - hostname: tempwebserver.example.com
+    service: http://localhost:8000
+  - service: http_status:404

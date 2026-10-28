@@ -1,0 +1,18 @@
+# 本地服务定义模板（services.json）
+# 迁移到新环境后按需修改：name / port / command / cwd
+# 注意：启动命令由插件以 `bash -c 'cd <cwd> && exec <command> > <log> 2>&1'` 方式执行，
+#       $! 即服务进程 PID（写入 PID 文件），停止/重启可靠。
+[
+  {
+    "name": "虚拟世界聊天群",
+    "port": 8000,
+    "command": "/data/dsh/home/test/.venv-miniconda/bin/python main.py",
+    "cwd": "/data/dsh/home/test/virtual-chat-group/backend"
+  },
+  {
+    "name": "easy下载",
+    "port": 8080,
+    "command": "/data/dsh/home/test/.venv-miniconda/bin/python -m http.server 8080",
+    "cwd": "/"
+  }
+]
