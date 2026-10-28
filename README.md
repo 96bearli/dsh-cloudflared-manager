@@ -84,6 +84,33 @@ cp plugin/* $DSH_HOME/profiles/node_modules/dsh-cloudflared-manager/
 
 ---
 
+## 运行环境
+
+**当前版本只支持 Linux x64，并且是按 Docker 容器环境调优的。**
+
+cloudflared 二进制路径与自动安装的 npm 包名都写死为 Linux x64：
+
+```
+<运行目录>/node_modules/@farthershore/cloudflared-linux-x64/bin/cloudflared
+```
+
+没有做 `process.platform` / `process.arch` 判断——这是有意的取舍：本项目在
+Docker 容器（PID 1 为 tini）里运行，容器内固定是 `linux/amd64`，硬编码换来的是
+更少的运行期分支。**在 macOS / Windows / ARM 上安装会拿不到可用的二进制。**
+
+容器环境下有三处专门处理：
+
+| 事项 | 处理 |
+|---|---|
+| `/tmp` 是 tmpfs（内存盘，容器重启即丢） | 日志统一写 `<运行目录>/logs/`，与 PID 文件同处持久卷 |
+| 容器内存有限，日志不该吃内存 | 同上，落磁盘而非 tmpfs |
+| `pts` / 进程树与宿主机隔离 | 进程探活与停止全部走 `/proc` 与 PID 文件，不依赖 `ps`/`pgrep` |
+
+若要在其他平台使用，需要自行修改 `CLOUDFLARED_BIN` 与 `ensureCloudflared()` 里的
+包名（如 `cloudflared-darwin-arm64`），并验证进程探活逻辑。
+
+---
+
 ## 配置
 
 运行目录默认为 `$DSH_HOME/cloudflared-setup/`（可用环境变量 `DSH_CF_SETUP` 覆盖）：
@@ -94,7 +121,8 @@ $DSH_HOME/cloudflared-setup/
 ├── config.yml          # Named 隧道本地配置备份
 ├── credentials.json    # 隧道凭证（敏感）
 ├── services.json       # 本地服务定义
-└── pids/               # PID 文件
+├── pids/               # PID 文件
+└── logs/               # 隧道与服务日志（放持久卷，容器重启不丢）
 ```
 
 `cf_config.json` 的字段说明见 [`runtime-examples/cf_config.json.example`](./runtime-examples/cf_config.json.example)。

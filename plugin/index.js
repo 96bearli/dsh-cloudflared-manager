@@ -17,7 +17,7 @@ import fs from 'node:fs'
 
 export const inject = ['shell', 'webServer']
 
-const PLUGIN_VERSION = '1.3.0'
+const PLUGIN_VERSION = '1.4.0'
 // ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
 //
 // 解析顺序：
@@ -71,6 +71,15 @@ const SERVICES_FILE = CF_SETUP + '/services.json'
 const CF_CONFIG_FILE = CF_SETUP + '/cf_config.json'   // { apiToken, zoneId, tunnelId, accountId, zoneWhitelist, ... }
 const CF_BIN_NAME = 'cloudflared'
 const PIDS_DIR = CF_SETUP + '/pids'   // PID 文件持久目录（容器重启保留）
+// 日志目录：与 PID 文件一样放在 CF_SETUP 下（持久卷）。
+//
+// ⚠ 为什么不用 /tmp：本机 DSH 跑在 Docker 容器里（PID 1 是 tini），
+//   /tmp 是 tmpfs 内存盘（256M，`df` 可见），**容器重启内容全丢**。
+//   日志放 /tmp 的话，隧道/服务出问题重进容器就看不到现场，排查只能靠猜；
+//   而 CF_SETUP 在持久卷上（/data/dsh），容器重建后日志仍在。
+//   另外 tmpfs 只有 256M，cloudflared 长时间运行写的连接日志会把内存吃掉，
+//   放在磁盘上更安全。
+const LOGS_DIR = CF_SETUP + '/logs'
 
 // ── 账号相关配置（tunnelId / accountId / zoneWhitelist）──
 //
@@ -445,7 +454,7 @@ export function apply(ctx) {
       if (!(alive.output || '').includes('yes')) {
         spawnManaged('named', 'named',
           `exec ${CLOUDFLARED_BIN} tunnel --config ${CONFIG_YML} run`,
-          '/tmp/dsh-cf-named.log')
+          LOGS_DIR + '/dsh-cf-named.log')
       }
     }
     // 2) 本地服务
@@ -472,7 +481,7 @@ export function apply(ctx) {
       }
       if (!isAlive) {
         const cwd = svc.cwd || '/'
-        const logPath = '/tmp/' + logName + '.log'
+        const logPath = LOGS_DIR + '/' + logName + '.log'
         spawnManaged('svc:' + svc.name, 'svc',
           `cd ${cwd} && exec ${(svc.command || '').trim()}`,
           logPath)
@@ -753,12 +762,20 @@ export function apply(ctx) {
 
   // 重启 Named 隧道（config 模式）：kill 现有进程 → nohup 启动（写 PID 文件）→ 等 metrics
   async function restartNamedTunnel() {
+    // ⚠ 必须先确保二进制就位。
+    //   历史 bug（2026-10-28 修复）：ensureCloudflared() 原先只在 cf-status 里调用，
+    //   而真正启动隧道的两个函数都不调用它。于是「刚装完插件、面板还没轮询到
+    //   cf-status」时点启动，拿到的错误是底层的
+    //   `bash: .../cloudflared: No such file or directory`——用户完全看不出是
+    //   「还没装好，稍等」。
+    const inst = await ensureCloudflared()
+    if (!inst.ok) return { error: 'cloudflared 尚未就绪：' + (inst.error || '自动安装未完成，请稍后重试') }
     await killByPidFile(PIDS_DIR + '/dsh-cf-named.pid')
     await killByCmd(CLOUDFLARED_BIN + ' tunnel --config')
     await new Promise((resolve) => setTimeout(resolve, 1200))
-    await sh(`mkdir -p ${PIDS_DIR} 2>/dev/null || true`, 5000)
+    await sh(`mkdir -p ${PIDS_DIR} ${LOGS_DIR} 2>/dev/null || true`, 5000)
     const start = await sh(
-      `bash -c 'exec ${CLOUDFLARED_BIN} tunnel --config ${CONFIG_YML} run > /tmp/dsh-cf-named.log 2>&1' & echo $! > ${PIDS_DIR}/dsh-cf-named.pid`,
+      `bash -c 'exec ${CLOUDFLARED_BIN} tunnel --config ${CONFIG_YML} run > ${LOGS_DIR}/dsh-cf-named.log 2>&1' & echo $! > ${PIDS_DIR}/dsh-cf-named.pid`,
       10000,
     )
     if (!start.ok) return { error: '隧道启动失败: ' + (start.output || '') }
@@ -827,9 +844,9 @@ export function apply(ctx) {
     if (!cmd) return { error: '缺少启动命令' }
     const cwd = svc.cwd || '/'
     const logName = 'dsh-svc-' + svcFileKey(svc.name || 'svc')
-    const logPath = '/tmp/' + logName + '.log'
+    const logPath = LOGS_DIR + '/' + logName + '.log'
     const pidFile = PIDS_DIR + '/' + logName + '.pid'
-    await sh(`mkdir -p ${PIDS_DIR} ${cwd} 2>/dev/null || true; rm -f ${pidFile}`, 5000)
+    await sh(`mkdir -p ${PIDS_DIR} ${LOGS_DIR} ${cwd} 2>/dev/null || true; rm -f ${pidFile}`, 5000)
     const q = (x) => String(x).replace(/'/g, "'\\''")
     const start = await sh(`bash -c 'cd ${q(cwd)} && exec ${q(cmd)} > ${q(logPath)} 2>&1' & echo $! > ${pidFile}`, 10000)
     if (!start.ok) return { error: '启动失败: ' + (start.output || '') }
@@ -945,7 +962,7 @@ export function apply(ctx) {
 
   // ---------------- 快速隧道（trycloudflare） ----------------
 
-  // 扫描快速隧道：读 PID 文件（/tmp/dsh-cf-<port>.pid）+ kill -0 探活（沙箱读 /proc 受限）
+  // 扫描快速隧道：读 PID 文件（PIDS_DIR/dsh-cf-<port>.pid）+ kill -0 探活（沙箱读 /proc 受限）
   async function scanQuickTunnels() {
     // ⚡ 优化：原先对每个 pid 文件做 3 次 sh（cat / kill -0 / grep 日志）。
     //   pids/ 目录里常年有若干已失效的残留 pid 文件（实测 4 个），
@@ -961,7 +978,7 @@ export function apply(ctx) {
       `pid=$(cat "$f" 2>/dev/null || true); ` +
       `[ -n "$pid" ] || continue; ` +
       `if kill -0 "$pid" 2>/dev/null; then ` +
-      `url=$(grep -oE 'https://[a-z0-9-]+\\.trycloudflare\\.com' /tmp/dsh-cf-$port.log 2>/dev/null | head -1 || true); ` +
+      `url=$(grep -oE 'https://[a-z0-9-]+\\.trycloudflare\\.com' ${LOGS_DIR}/dsh-cf-$port.log 2>/dev/null | head -1 || true); ` +
       `echo "$port|$pid|$url"; ` +
       `fi; ` +
       `done`,
@@ -983,10 +1000,14 @@ export function apply(ctx) {
   async function startQuickTunnel(port) {
     const p = parseInt(port, 10)
     if (!Number.isFinite(p) || p < 1 || p > 65535) return { error: '端口无效' }
+    // 与 restartNamedTunnel 同理：启动前先确保二进制就位，
+    // 否则会把底层的 "No such file or directory" 直接抛给用户。
+    const inst = await ensureCloudflared()
+    if (!inst.ok) return { error: 'cloudflared 尚未就绪：' + (inst.error || '自动安装未完成，请稍后重试') }
     const existing = await scanQuickTunnels()
     if (existing.some((m) => m.port === p)) return { error: `端口 ${p} 已有快速隧道在运行` }
-    const logPath = `/tmp/dsh-cf-${p}.log`
-    await sh(`mkdir -p ${PIDS_DIR} 2>/dev/null || true; rm -f ${logPath} ${PIDS_DIR}/dsh-cf-${p}.pid`, 5000)
+    const logPath = `${LOGS_DIR}/dsh-cf-${p}.log`
+    await sh(`mkdir -p ${PIDS_DIR} ${LOGS_DIR} 2>/dev/null || true; rm -f ${logPath} ${PIDS_DIR}/dsh-cf-${p}.pid`, 5000)
     const start = await sh(
       `bash -c 'exec ${CLOUDFLARED_BIN} tunnel --url http://localhost:${p} --no-autoupdate > ${logPath} 2>&1' & echo $! > ${PIDS_DIR}/dsh-cf-${p}.pid`,
       10000,
@@ -1334,7 +1355,7 @@ export function apply(ctx) {
         } else if (method === 'cf-svc-log') {
           const name = typeof args.name === 'string' ? args.name.trim() : ''
           const logName = 'dsh-svc-' + svcFileKey(name)
-          const logPath = '/tmp/' + logName + '.log'
+          const logPath = LOGS_DIR + '/' + logName + '.log'
           const lines = parseInt(args.lines, 10) || 100
           const r = await sh(`tail -n ${lines} ${logPath} 2>/dev/null || echo '（无日志文件）'`, 6000)
           return { ok: true, name, logPath, tail: r.output || '（空）' }
@@ -1515,7 +1536,15 @@ export function apply(ctx) {
     // 自动启动：Named 隧道 + 标记了 autoStart 的本地服务
     // 先加载账号配置（tunnelId/accountId/zoneWhitelist）再跑 autoStart：
     // 隧道命令与 buildConfigYaml 都要用这些值，顺序不能反。
-    refreshCfMeta().catch(() => {}).finally(() => { autoStart().catch(() => {}) })
+    //
+    // 先把持久目录建出来（pids / logs）。容器里 CF_SETUP 在持久卷上，
+    // 但目录可能还没创建（例如全新安装后第一次启动），提前 mkdir 一次，
+    // 避免首次写日志/PID 时因目录不存在而静默失败。
+    sh(`mkdir -p ${PIDS_DIR} ${LOGS_DIR} 2>/dev/null || true`, 5000)
+      .catch(() => {})
+      .finally(() => {
+        refreshCfMeta().catch(() => {}).finally(() => { autoStart().catch(() => {}) })
+      })
 
     // 优雅关闭：杀掉所有受管进程
     const sigHandler = () => { killAllManaged() }
