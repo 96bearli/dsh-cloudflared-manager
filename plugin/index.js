@@ -17,7 +17,7 @@ import fs from 'node:fs'
 
 export const inject = ['shell', 'webServer']
 
-const PLUGIN_VERSION = '1.6.0'
+const PLUGIN_VERSION = '1.7.0'
 // ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
 //
 // 解析顺序：
@@ -1282,7 +1282,15 @@ export function apply(ctx) {
               totalCount = (lr.result_info && lr.result_info.total_count) || available.length
             }
           }
-          return { zones, whitelist, available, totalCount }
+          // 一并回传 tokenSet / zoneRead：
+          // 前端要区分「没配 Token」「有 Token 但缺 Zone:Read」「列表为空」，
+          // 才能给出准确的状态说明，而不是笼统说"获取失败"。
+          return {
+            zones, whitelist, available, totalCount,
+            tokenSet: !!cfg.apiToken,
+            // 有 Token 却一个 zone 都没拿到 → 基本可判定缺 Zone:Read 权限
+            zoneRead: cfg.apiToken ? available.length > 0 : false,
+          }
         } else if (method === 'cf-maps') {
           return { quickTunnels: await scanQuickTunnels() }
         } else if (method === 'cf-map-add') {

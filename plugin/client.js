@@ -1753,10 +1753,17 @@ window.__ModuleLoader__.load({
         // 根域名白名单编辑态
         const [apexInput, setApexInput] = React.useState('')
         const [zoneStatus, setZoneStatus] = React.useState({})   // apex -> true/false（可写 DNS？）
-        // 账号下可选的 zone 列表（来自 cf-zones），用于下拉候选。
-        // 空数组时（无 Token / 无 Zone:Read）前端退回手输。
-        const [zonesAvail, setZonesAvail] = React.useState([])
-        const [zonesFetched, setZonesFetched] = React.useState(false)
+        // 账号下可选的 zone 列表（来自 cf-zones），用于**可输入下拉**的候选。
+        //
+        // 用显式状态机而不是「空数组 = 没数据」：
+        //   loading  请求未回 → 下拉里放一条不可选的「加载中…」
+        //   ok       拿到列表 → 正常列出候选
+        //   nokey    未配Token→ 不可选项提示原因，仍可手输
+        //   empty    接口通但空 → 不可选项提示原因，仍可手输
+        //   error    请求失败  → 不可选项带错误，仍可手输
+        // 之前只有「空数组 + fetched 布尔」，区分不出「加载中」和「加载失败」，
+        // 表现为输入框/下拉来回跳，用户不知道发生了什么。
+        const [zonesState, setZonesState] = React.useState({ phase: 'loading', items: [], error: '', total: 0 })
 
         const load = React.useCallback(async () => {
           try { setStatus(await api('cf-status')) } catch (e) { setNotice('状态加载失败：' + String(e && e.message || e)) }
@@ -1768,15 +1775,31 @@ window.__ModuleLoader__.load({
         // 与面板侧那个 (msg, type) 版本区分开，避免混用。
         const flash = (msg) => { setNotice(msg); setTimeout(() => setNotice(''), 8000) }
 
-        // 拉取账号下可选的 zone（下拉候选）。
-        // 失败不打扰用户：没有 Token 或没有 Zone:Read 时 available 为空，
-        // 前端自动退回手输，不影响添加白名单本身。
+        // 拉取账号下可选的 zone（可输入下拉的候选）。
+        // 无论成败都落到一个明确状态，让下拉如实展示当前处境。
         const loadZones = React.useCallback(async () => {
+          setZonesState({ phase: 'loading', items: [], error: '', total: 0 })
           try {
             const r = await api('cf-zones', {})
-            setZonesAvail(Array.isArray(r && r.available) ? r.available : [])
-          } catch (e) { setZonesAvail([]) }
-          setZonesFetched(true)
+            const items = Array.isArray(r && r.available) ? r.available : []
+            if (items.length > 0) {
+              setZonesState({ phase: 'ok', items, error: '', total: (r && r.totalCount) || items.length })
+            } else {
+              // 接口通了但没有候选：多半是没 Token，或缺 Zone:Read 权限
+              const noKey = r && r.tokenSet === false
+              setZonesState({
+                phase: noKey ? 'nokey' : 'empty',
+                items: [], total: 0,
+                error: noKey
+                  ? '未配置 API Token，无法获取域名列表'
+                  : (r && r.zoneRead === false
+                    ? 'Token 缺少 Zone:Read 权限，无法列出账号下的域名'
+                    : '账号下没有可用域名'),
+              })
+            }
+          } catch (e) {
+            setZonesState({ phase: 'error', items: [], total: 0, error: String(e && e.message || e) })
+          }
         }, [])
         React.useEffect(() => { loadZones() }, [loadZones])
 
@@ -1961,43 +1984,88 @@ window.__ModuleLoader__.load({
                 )
               : null,
             // 添加行：能列出账号下 zone 时用下拉（省事、不会打错），
-            // 否则退回手输（无 Token / 无 Zone:Read / 还没拉到列表时）。
+            // 可输入下拉（input + datalist）：
+            //   · 既能从账号下已有的域名里挑，也能直接敲一个（Token 缺
+            //     Zone:Read 或列表没拉到时的必经路径）
+            //   · 候选里已加入白名单的不再列出，避免重复添加
+            //   · 列表状态（加载中 / 加载失败 / 未配 Token）作为一条**不可选**
+            //     的候选显示，而不是把输入框换成下拉或干脆消失 —— 后两种做法
+            //     会让用户看不出到底发生了什么。
             //
-            // 下拉只列「尚未加入白名单」的域名，已加的不重复出现。
+            // 为什么用 datalist 而不是自绘下拉：原生 <input list> 天然支持
+            // 「可输入 + 有候选项 + 键盘可达」，不需要自己处理聚焦、点外关闭、
+            // 键盘上下选、无障碍焦点管理。自绘那套容易在小面板里出 bug。
             (() => {
-              const candidates = zonesAvail.filter((z) => !z.inWhitelist)
-              const useSelect = zonesFetched && candidates.length > 0
+              const LIST_ID = 'dshcf-apex-candidates'
+              const st = zonesState
+              const candidates = (st.phase === 'ok' ? st.items : []).filter((z) => !z.inWhitelist)
+
+              // 候选清单：先放一条状态行（不可选），再放真实候选。
+              //
+              // ⚠ value 不能用空串：浏览器（Chrome/Firefox 实测）会把
+              //   value="" 的 datalist option 直接丢掉，状态行根本不显示。
+              //   这里给状态行一个不可能与真实域名冲突的占位 value，
+              //   再用 disabled 让它灰显、点不中。
+              const statusValue = '\u0000status'
+              let statusOption = null
+              if (st.phase === 'loading') {
+                statusOption = { value: statusValue, label: '⏳ 加载中…（正在获取账号下的域名）' }
+              } else if (st.phase === 'nokey' || st.phase === 'empty' || st.phase === 'error') {
+                statusOption = { value: statusValue, label: '⚠ ' + (st.error || '无法获取域名列表，可手动输入') }
+              } else if (st.phase === 'ok' && candidates.length === 0) {
+                statusOption = { value: statusValue, label: 'ℹ 账号下的域名都已在白名单里了，可手动输入其它域名' }
+              }
+
+              const hint = st.phase === 'loading'
+                ? '正在获取账号下的域名…'
+                : st.phase === 'error'
+                  ? '获取域名列表失败：' + st.error + '。仍可手动输入根域名。'
+                  : (st.phase === 'nokey' || st.phase === 'empty')
+                    ? st.error + '。仍可手动输入根域名。'
+                    : (candidates.length > 0
+                      ? '下拉列出账号下尚未加入的域名（共 ' + candidates.length + ' 个），也可直接输入。'
+                      : '账号下的域名都已在白名单里，可直接输入其它根域名。')
+
               return React.createElement(React.Fragment, null,
                 React.createElement('div', { className: 'dshcf-add', style: { marginTop: 10 } },
-                  useSelect
-                    ? React.createElement('select', {
-                        className: 'dshcf-w3',
-                        style: { flex: '1 1 200px' },
-                        value: apexInput,
-                        onChange: (e) => setApexInput(e.target.value),
-                      },
-                        React.createElement('option', { value: '' }, '选择账号下的根域名…（共 ' + candidates.length + ' 个可选）'),
-                        candidates.map((z) => React.createElement('option', { key: z.name, value: z.name },
-                          z.name + (z.status && z.status !== 'active' ? '（' + z.status + '）' : ''))),
-                      )
-                    : React.createElement('input', {
-                        className: 'dshcf-w3',
-                        style: { flex: '1 1 200px' },
-                        placeholder: '根域名，如 example.com',
-                        value: apexInput,
-                        onChange: (e) => setApexInput(e.target.value),
-                        onKeyDown: (e) => { if (e.key === 'Enter') addApex() },
-                      }),
+                  React.createElement('input', {
+                    className: 'dshcf-w3',
+                    style: { flex: '1 1 200px' },
+                    list: LIST_ID,
+                    placeholder: st.phase === 'loading' ? '加载账号域名中…也可直接输入，如 example.com' : '根域名，如 example.com（可从下拉选）',
+                    value: apexInput,
+                    onChange: (e) => {
+                      // 状态行占位值被选中时（某些浏览器仍允许），忽略掉，
+                      // 避免把 \u0000status 写进输入框再提交给后端。
+                      const v = e.target.value
+                      setApexInput(v === statusValue ? '' : v)
+                    },
+                    onKeyDown: (e) => { if (e.key === 'Enter') addApex() },
+                    autoComplete: 'off',
+                  }),
+                  // datalist 是 input 的候选来源；disabled 的 option 浏览器会
+                  // 灰显且不可选中，正好表达「这条只是状态说明」。
+                  React.createElement('datalist', { id: LIST_ID },
+                    statusOption
+                      ? React.createElement('option', { value: statusValue, disabled: true, label: statusOption.label })
+                      : null,
+                    candidates.map((z) => React.createElement('option', {
+                      key: z.name,
+                      value: z.name,
+                      label: z.status && z.status !== 'active' ? z.name + '（' + z.status + '）' : z.name,
+                    })),
+                  ),
                   React.createElement('button', { className: 'dshcf-btn dshcf-btn-primary', onClick: addApex, disabled: busy || !apexInput.trim() }, busy ? '处理中…' : '＋ 添加域名'),
+                  st.phase === 'loading'
+                    ? null
+                    : React.createElement('button', {
+                        className: 'dshcf-btn dshcf-btn-sm',
+                        onClick: loadZones,
+                        disabled: busy,
+                        title: '重新从 Cloudflare 获取账号下的域名列表',
+                      }, '刷新列表'),
                 ),
-                // 状态说明：让用户知道为什么有时是下拉、有时是手输
-                React.createElement('div', { className: 'dshcf-tip', style: { marginTop: 6 } },
-                  useSelect
-                    ? '列表来自你 Cloudflare 账号下已有的域名，选中即可。'
-                    : (zonesFetched && zonesAvail.length > 0
-                      ? '账号下 ' + zonesAvail.length + ' 个域名都已在白名单里了。'
-                      : '未取到账号域名列表（需要有效 Token 且具备 Zone:Read 权限），可手动输入根域名。'),
-                ),
+                React.createElement('div', { className: 'dshcf-tip', style: { marginTop: 6 } }, hint),
               )
             })(),
             React.createElement('div', { className: 'dshcf-tip', style: { marginTop: 8 } },
