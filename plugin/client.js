@@ -1753,6 +1753,10 @@ window.__ModuleLoader__.load({
         // 根域名白名单编辑态
         const [apexInput, setApexInput] = React.useState('')
         const [zoneStatus, setZoneStatus] = React.useState({})   // apex -> true/false（可写 DNS？）
+        // 账号下可选的 zone 列表（来自 cf-zones），用于下拉候选。
+        // 空数组时（无 Token / 无 Zone:Read）前端退回手输。
+        const [zonesAvail, setZonesAvail] = React.useState([])
+        const [zonesFetched, setZonesFetched] = React.useState(false)
 
         const load = React.useCallback(async () => {
           try { setStatus(await api('cf-status')) } catch (e) { setNotice('状态加载失败：' + String(e && e.message || e)) }
@@ -1760,7 +1764,21 @@ window.__ModuleLoader__.load({
         }, [])
         React.useEffect(() => { load() }, [load])
 
+        // 这个设置页的 flash 只接收消息；错误态沿用 setNotice 即可，
+        // 与面板侧那个 (msg, type) 版本区分开，避免混用。
         const flash = (msg) => { setNotice(msg); setTimeout(() => setNotice(''), 8000) }
+
+        // 拉取账号下可选的 zone（下拉候选）。
+        // 失败不打扰用户：没有 Token 或没有 Zone:Read 时 available 为空，
+        // 前端自动退回手输，不影响添加白名单本身。
+        const loadZones = React.useCallback(async () => {
+          try {
+            const r = await api('cf-zones', {})
+            setZonesAvail(Array.isArray(r && r.available) ? r.available : [])
+          } catch (e) { setZonesAvail([]) }
+          setZonesFetched(true)
+        }, [])
+        React.useEffect(() => { loadZones() }, [loadZones])
 
         const nt = status && status.namedTunnel
         const ca = status && status.cfApi
@@ -1806,7 +1824,9 @@ window.__ModuleLoader__.load({
             else {
               flash(r.already ? ('已在白名单中：' + r.apex) : ('已添加：' + r.apex))
               setApexInput('')
+              // 刷新状态与候选列表：刚加的这个域名要从下拉里消失（已加的不再可选）
               await load()
+              await loadZones()
               // 加完顺手验一下能不能写 DNS，有问题当场就能看到，
               // 免得等到建映射时才发现这个域名根本用不了。
               try {
@@ -1833,6 +1853,8 @@ window.__ModuleLoader__.load({
               flash(r.removed ? ('已移除：' + apex) : ('不在白名单中：' + apex))
               setZoneStatus((prev) => { const n = { ...prev }; delete n[apex]; return n })
               await load()
+              // 移除后该域名要重新出现在下拉候选里
+              await loadZones()
             }
           } catch (e) { flash('移除失败：' + String(e && e.message || e), 'err') }
           setBusy(false)
@@ -1938,20 +1960,49 @@ window.__ModuleLoader__.load({
                   }),
                 )
               : null,
-            React.createElement('div', { className: 'dshcf-add', style: { marginTop: 10 } },
-              React.createElement('input', {
-                className: 'dshcf-w3',
-                style: { flex: '1 1 200px' },
-                placeholder: '根域名，如 example.com',
-                value: apexInput,
-                onChange: (e) => setApexInput(e.target.value),
-                onKeyDown: (e) => { if (e.key === 'Enter') addApex() },
-              }),
-              React.createElement('button', { className: 'dshcf-btn dshcf-btn-primary', onClick: addApex, disabled: busy }, busy ? '处理中…' : '＋ 添加域名'),
-            ),
+            // 添加行：能列出账号下 zone 时用下拉（省事、不会打错），
+            // 否则退回手输（无 Token / 无 Zone:Read / 还没拉到列表时）。
+            //
+            // 下拉只列「尚未加入白名单」的域名，已加的不重复出现。
+            (() => {
+              const candidates = zonesAvail.filter((z) => !z.inWhitelist)
+              const useSelect = zonesFetched && candidates.length > 0
+              return React.createElement(React.Fragment, null,
+                React.createElement('div', { className: 'dshcf-add', style: { marginTop: 10 } },
+                  useSelect
+                    ? React.createElement('select', {
+                        className: 'dshcf-w3',
+                        style: { flex: '1 1 200px' },
+                        value: apexInput,
+                        onChange: (e) => setApexInput(e.target.value),
+                      },
+                        React.createElement('option', { value: '' }, '选择账号下的根域名…（共 ' + candidates.length + ' 个可选）'),
+                        candidates.map((z) => React.createElement('option', { key: z.name, value: z.name },
+                          z.name + (z.status && z.status !== 'active' ? '（' + z.status + '）' : ''))),
+                      )
+                    : React.createElement('input', {
+                        className: 'dshcf-w3',
+                        style: { flex: '1 1 200px' },
+                        placeholder: '根域名，如 example.com',
+                        value: apexInput,
+                        onChange: (e) => setApexInput(e.target.value),
+                        onKeyDown: (e) => { if (e.key === 'Enter') addApex() },
+                      }),
+                  React.createElement('button', { className: 'dshcf-btn dshcf-btn-primary', onClick: addApex, disabled: busy || !apexInput.trim() }, busy ? '处理中…' : '＋ 添加域名'),
+                ),
+                // 状态说明：让用户知道为什么有时是下拉、有时是手输
+                React.createElement('div', { className: 'dshcf-tip', style: { marginTop: 6 } },
+                  useSelect
+                    ? '列表来自你 Cloudflare 账号下已有的域名，选中即可。'
+                    : (zonesFetched && zonesAvail.length > 0
+                      ? '账号下 ' + zonesAvail.length + ' 个域名都已在白名单里了。'
+                      : '未取到账号域名列表（需要有效 Token 且具备 Zone:Read 权限），可手动输入根域名。'),
+                ),
+              )
+            })(),
             React.createElement('div', { className: 'dshcf-tip', style: { marginTop: 8 } },
-              '填根域名（example.com），不是子域名（别填 a.example.com）。',
-              '可直接粘贴 https://example.com/xxx 或 *.example.com，会自动清洗。',
+              '根域名（example.com）而非子域名（不是 a.example.com）。',
+              '手动输入时可直接粘贴 https://example.com/xxx 或 *.example.com，会自动清洗。',
               '多条时按最长后缀匹配，所以 a.b.example.com 归属 example.com。'),
           ),
           notice ? React.createElement('div', { className: 'dshcf-status' }, notice) : null,

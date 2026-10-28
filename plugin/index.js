@@ -17,7 +17,7 @@ import fs from 'node:fs'
 
 export const inject = ['shell', 'webServer']
 
-const PLUGIN_VERSION = '1.5.0'
+const PLUGIN_VERSION = '1.6.0'
 // ── 运行目录（存放 cf_config.json / services.json / credentials.json / pids/）──
 //
 // 解析顺序：
@@ -1238,10 +1238,22 @@ export function apply(ctx) {
                   (badZones.length ? `；不可用：${badZones.map((z) => z.apex).join('、')}` : '')),
           }
         } else if (method === 'cf-zones') {
-          // 供前端渲染「首级域名」下拉：返回白名单 + 各自当前是否可写 DNS
+          // 供前端渲染「根域名」下拉。
+          //
+          // 返回两份数据：
+          //   zones        白名单内的域名，逐条附 zoneId 与可解析性（旧契约，保留）
+          //   available    账号下**全部** zone（来自 Cloudflare API），用于下拉候选
+          //
+          // 为什么要拉全量：白名单是要用户从自己已有的域名里挑，让他手打
+          // "example.com" 既费事又容易打错（打错就会存进一个永远匹配不上的串，
+          // 之后建映射全被拒，还看不出为什么）。既然 Token 有 Zone:Read，
+          // 直接把账号下的域名列出来让人选即可。
+          //
+          // 无 Token / 无 Zone:Read 时 available 为空，前端自动退回手输。
           const cfg = await readCfConfig()
+          const whitelist = ZONE_WHITELIST()
           const zones = []
-          for (const apex of ZONE_WHITELIST()) {
+          for (const apex of whitelist) {
             let zoneId = zoneIdCache.get(apex) || null
             if (!zoneId && cfg.apiToken) {
               const zr = await cfApiGet(cfg, '/zones?name=' + encodeURIComponent(apex))
@@ -1250,7 +1262,27 @@ export function apply(ctx) {
             }
             zones.push({ apex, zoneId, resolvable: !!zoneId })
           }
-          return { zones, whitelist: ZONE_WHITELIST() }
+
+          let available = []
+          let totalCount = 0
+          if (cfg.apiToken) {
+            // 一次拉最多 50 个（单账号域名数通常远小于此）。超出部分不翻页，
+            // 只把总数回传，避免为一个下拉框连打多次 API 拖慢面板。
+            const lr = await cfApiGet(cfg, '/zones?per_page=50&page=1')
+            if (lr.success && Array.isArray(lr.result)) {
+              available = lr.result
+                .filter((z) => z && typeof z.name === 'string')
+                .map((z) => ({
+                  name: String(z.name).toLowerCase(),
+                  status: z.status || '',
+                  zoneId: z.id || null,
+                  inWhitelist: whitelist.includes(String(z.name).toLowerCase()),
+                }))
+                .sort((a, b) => a.name.localeCompare(b.name))
+              totalCount = (lr.result_info && lr.result_info.total_count) || available.length
+            }
+          }
+          return { zones, whitelist, available, totalCount }
         } else if (method === 'cf-maps') {
           return { quickTunnels: await scanQuickTunnels() }
         } else if (method === 'cf-map-add') {
